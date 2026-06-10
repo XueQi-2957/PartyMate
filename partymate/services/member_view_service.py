@@ -14,6 +14,7 @@ class MemberViewService:
         member = self.repo.get_member(member_id)
         if not member:
             return {}
+        pending_ocr_tasks = self._build_pending_ocr_tasks(member_id)
 
         return {
             **member,
@@ -39,6 +40,8 @@ class MemberViewService:
             "latest_material_check": self._decode_check(
                 self.repo.get_latest_material_check(member_id)
             ),
+            "pending_ocr_tasks": pending_ocr_tasks,
+            "pending_ocr_task_count": len(pending_ocr_tasks),
         }
 
     def build_dashboard(self) -> dict[str, Any]:
@@ -87,3 +90,32 @@ class MemberViewService:
         decoded["id"] = row["id"]
         decoded["created_at"] = row["created_at"]
         return decoded
+
+    def _build_pending_ocr_tasks(self, member_id: int) -> list[dict[str, Any]]:
+        tasks = self.repo.list_member_ocr_tasks(member_id, status="review_required")
+        result: list[dict[str, Any]] = []
+        for task in tasks:
+            material_file = self.repo.get_material_file(task["material_file_id"])
+            confidence_summary = self._decode_json(
+                task.get("confidence_summary_json", "{}"),
+                {},
+            )
+            result.append(
+                {
+                    "task_id": task["id"],
+                    "material_file_id": task["material_file_id"],
+                    "original_name": material_file.get("original_name", ""),
+                    "review_status": material_file.get("review_status", ""),
+                    "created_at": task.get("created_at", ""),
+                    "confidence_summary": confidence_summary,
+                }
+            )
+        return result
+
+    def _decode_json(self, payload: str, default: Any) -> Any:
+        if not payload:
+            return default
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return default

@@ -29,6 +29,7 @@ from partymate.services import (
     MaterialCheckService,
     MaterialImportService,
     MemberViewService,
+    OCRReviewService,
 )
 from partymate.tools.content_gen import format_content_plan, generate_meeting_content
 from partymate.tools.doc_check import check_document, detect_doc_type
@@ -77,6 +78,7 @@ def create_app(
     member_views = MemberViewService(repo)
     import_service = MaterialImportService(repo=repo, data_root=base_data_root)
     check_service = MaterialCheckService(repo)
+    ocr_reviews = OCRReviewService(repo=repo, data_root=base_data_root)
 
     async def api_check_doc(request):
         body = await request.json()
@@ -324,6 +326,28 @@ def create_app(
         result = check_service.run_for_member(member_id, body.get("batch_id"))
         return JSONResponse(result)
 
+    async def api_get_ocr_task(request):
+        task_id = int(request.path_params["task_id"])
+        detail = ocr_reviews.build_task_detail(task_id)
+        if not detail:
+            return JSONResponse({"error": "OCR 任务未找到"}, status_code=404)
+        return JSONResponse(detail)
+
+    async def api_confirm_ocr_task(request):
+        body = await request.json()
+        task_id = int(body.get("task_id", 0))
+        try:
+            task = ocr_reviews.confirm_task(
+                task_id=task_id,
+                confirmed_text=body.get("confirmed_text", ""),
+                review_notes=body.get("review_notes", ""),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "not found" in message else 400
+            return JSONResponse({"error": message}, status_code=status_code)
+        return JSONResponse({"task": task})
+
     async def api_add_event(request):
         member_id = int(request.path_params["member_id"])
         if not repo.get_member(member_id):
@@ -395,6 +419,8 @@ def create_app(
         Route("/api/members/{member_id}/materials/check", api_member_material_check, methods=["POST"]),
         Route("/api/members/{member_id}/events", api_add_event, methods=["POST"]),
         Route("/api/materials/archive/import", api_material_archive_import, methods=["POST"]),
+        Route("/api/ocr/tasks/{task_id}", api_get_ocr_task),
+        Route("/api/ocr/confirm", api_confirm_ocr_task, methods=["POST"]),
         Route("/api/dashboard", api_dashboard),
         Route("/api/reminders", api_reminders),
         Route("/api/members/import", api_import_members, methods=["POST"]),
