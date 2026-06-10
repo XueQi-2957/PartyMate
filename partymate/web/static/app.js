@@ -626,6 +626,7 @@ const STAGE_CLASSES = {
 };
 
 let _selectedMemberId = null;
+let _selectedOCRTaskId = null;
 let _kanbanRefreshInterval = null;
 
 function openMemberArchivePicker(memberId) {
@@ -682,6 +683,136 @@ async function runMemberMaterialCheck(memberId, batchId) {
     await renderMemberDetail(memberId);
   } catch (e) {
     showKanbanError('整套核查失败: ' + e.message);
+  }
+}
+
+function closeOCRReviewPanel() {
+  _selectedOCRTaskId = null;
+  const panel = document.getElementById('ocrReviewPanel');
+  if (!panel) return;
+  panel.style.display = 'none';
+  panel.innerHTML = `
+    <div style="color:var(--text-dim);padding:20px;text-align:center;font-size:13px">
+      选择待复核 OCR 任务后在此处查看和确认文本
+    </div>`;
+}
+
+async function openOCRReviewTask(taskId) {
+  _selectedOCRTaskId = taskId;
+  const panel = document.getElementById('ocrReviewPanel');
+  if (!panel) return;
+  panel.style.display = 'block';
+  panel.innerHTML = '<div class="loading" style="padding:20px;text-align:center">加载 OCR 复核任务...</div>';
+
+  try {
+    const resp = await fetch('/api/ocr/tasks/' + taskId);
+    const data = await resp.json();
+    if (data.error) {
+      panel.innerHTML = '<div style="color:var(--red);padding:20px">❌ ' + escapeHtml(String(data.error)) + '</div>';
+      return;
+    }
+    renderOCRReviewPanel(data);
+  } catch (e) {
+    panel.innerHTML = '<div style="color:var(--red);padding:20px">❌ 加载 OCR 任务失败: ' + escapeHtml(String(e.message)) + '</div>';
+  }
+}
+
+function renderOCRReviewPanel(data) {
+  const panel = document.getElementById('ocrReviewPanel');
+  if (!panel) return;
+
+  const task = data.task || {};
+  const file = data.file || {};
+  const summary = data.confidence_summary || {};
+  const lowSegments = data.low_confidence_segments || [];
+  const confirmedText = data.confirmed_text || data.raw_text || '';
+
+  let lowSegmentHtml = '<div class="timeline-empty">暂无低置信度片段</div>';
+  if (lowSegments.length > 0) {
+    lowSegmentHtml = lowSegments.map(item => `
+      <div class="issue-item">
+        <div class="issue-tag">置信度 ${(Number(item.confidence || 0) * 100).toFixed(0)}%</div>
+        <div class="issue-text">${escapeHtml(String(item.text || ''))}</div>
+      </div>`).join('');
+  }
+
+  panel.innerHTML = `
+    <div class="member-detail">
+      <div class="detail-header">
+        <div class="detail-name">🔎 OCR 复核</div>
+        <span class="stage-badge" style="font-size:12px;padding:3px 12px;background:var(--gold-light);color:#8b6914">
+          ${escapeHtml(String(task.status || 'review_required'))}
+        </span>
+      </div>
+      <div class="detail-meta">
+        <span>📄 文件: ${escapeHtml(String(file.original_name || ''))}</span>
+        <span>⚠️ 低置信度片段: ${summary.low_confidence_count || 0}</span>
+        <span>📊 平均置信度: ${summary.average_confidence || 0}</span>
+      </div>
+      <div class="detail-actions">
+        <button class="btn btn-primary" onclick="confirmOCRReviewTask(${task.id})">✅ 确认入库</button>
+        <button class="btn btn-secondary" onclick="closeOCRReviewPanel()">关闭</button>
+      </div>
+      <div class="detail-section">
+        <div class="detail-section-title">⚠️ 低置信度片段</div>
+        ${lowSegmentHtml}
+      </div>
+      <div class="split-layout" style="margin-top:12px">
+        <div class="split-panel">
+          <div class="split-panel-header">
+            <span>📄 OCR 原始草稿</span>
+          </div>
+          <div class="split-panel-body">
+            <pre style="white-space:pre-wrap">${escapeHtml(String(data.raw_text || ''))}</pre>
+          </div>
+        </div>
+        <div class="split-panel">
+          <div class="split-panel-header">
+            <span>✍️ 人工确认文本</span>
+          </div>
+          <div class="split-panel-body">
+            <textarea class="field-textarea" id="ocrConfirmedText" rows="14">${escapeHtml(String(confirmedText))}</textarea>
+            <label class="field-label" style="margin-top:12px">复核备注</label>
+            <textarea class="field-textarea" id="ocrReviewNotes" rows="3" placeholder="可选：记录修正点或风险说明"></textarea>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function confirmOCRReviewTask(taskId) {
+  const textEl = document.getElementById('ocrConfirmedText');
+  const notesEl = document.getElementById('ocrReviewNotes');
+  const confirmedText = textEl ? textEl.value.trim() : '';
+  const reviewNotes = notesEl ? notesEl.value.trim() : '';
+
+  if (!confirmedText) {
+    showKanbanError('请先填写确认后的 OCR 文本');
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/ocr/confirm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        task_id: taskId,
+        confirmed_text: confirmedText,
+        review_notes: reviewNotes,
+      }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      showKanbanError(data.error);
+      return;
+    }
+    closeOCRReviewPanel();
+    if (_selectedMemberId) {
+      await renderMemberDetail(_selectedMemberId);
+      await loadDashboard();
+    }
+  } catch (e) {
+    showKanbanError('OCR 确认失败: ' + e.message);
   }
 }
 
@@ -813,6 +944,7 @@ function daysUntil(dateStr) {
 
 async function selectMember(memberId) {
   _selectedMemberId = memberId;
+  closeOCRReviewPanel();
   // Update selected class on cards
   document.querySelectorAll('.member-card').forEach(el => {
     el.classList.toggle('selected', parseInt(el.dataset.id) === memberId);
@@ -878,6 +1010,26 @@ async function renderMemberDetail(memberId) {
       <div class="detail-section-title">🧾 最近整套核查</div>
       <div>错误 ${latestCheck.summary?.error_count || 0} · 警告 ${latestCheck.summary?.warning_count || 0} · 待确认 ${latestCheck.summary?.review_count || 0}</div>
     </div>`;
+
+    const pendingOCRTasks = m.pending_ocr_tasks || [];
+    html += `<div class="detail-section">
+      <div class="detail-section-title">🧠 OCR 待复核 (${m.pending_ocr_task_count || 0})</div>`;
+    if (pendingOCRTasks.length === 0) {
+      html += `<div class="timeline-empty">暂无 OCR 待复核任务</div>`;
+    } else {
+      html += `<div class="material-list">`;
+      for (const task of pendingOCRTasks) {
+        const summary = task.confidence_summary || {};
+        html += `<div class="material-item material-pending">
+          <span class="material-check">📝</span>
+          <span class="material-name">${escapeHtml(String(task.original_name || ''))}</span>
+          <span class="material-status badge-pending">低置信度 ${summary.low_confidence_count || 0}</span>
+          <button class="btn btn-sm" onclick="openOCRReviewTask(${task.task_id})">开始复核</button>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
 
     // Material progress bar
     const allMats = m.materials || [];

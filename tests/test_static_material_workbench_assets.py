@@ -10,11 +10,16 @@ class StaticMaterialWorkbenchAssetTests(unittest.TestCase):
         js = Path("partymate/web/static/app.js").read_text(encoding="utf-8")
 
         self.assertIn('id="memberArchiveInput"', html)
+        self.assertIn('id="ocrReviewPanel"', html)
         self.assertIn("openMemberArchivePicker(", js)
         self.assertIn("handleMemberArchiveSelected(", js)
         self.assertIn("runMemberMaterialCheck(", js)
+        self.assertIn("openOCRReviewTask(", js)
+        self.assertIn("confirmOCRReviewTask(", js)
         self.assertIn("/api/materials/archive/import", js)
         self.assertIn("/materials/check", js)
+        self.assertIn("/api/ocr/tasks/", js)
+        self.assertIn("/api/ocr/confirm", js)
 
 
 if __name__ == "__main__":
