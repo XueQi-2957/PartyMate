@@ -150,6 +150,76 @@ class MaterialCheckServiceTests(unittest.TestCase):
             repo.close()
             temp_dir.cleanup()
 
+    def test_run_for_member_prefers_confirmed_ocr_text_over_raw_text(self) -> None:
+        temp_dir, repo = make_temp_repo()
+        try:
+            member = repo.add_member(
+                name="张三",
+                major="计算机科学与技术",
+                student_id="2023010001",
+            )
+            batch = repo.create_material_import_batch(
+                member_id=member["id"],
+                archive_name="materials.zip",
+                archive_path="archive.zip",
+                extract_dir="extract",
+                status="completed_with_review",
+            )
+            text_dir = Path(temp_dir.name) / "texts"
+            text_dir.mkdir()
+            raw_path = text_dir / "file_1.txt"
+            raw_path.write_text("李四 软件工程 2023010001 思想汇报", encoding="utf-8")
+
+            review_dir = Path(temp_dir.name) / "material_imports" / f"member_{member['id']}" / f"batch_{batch['id']}" / "ocr_reviews"
+            review_dir.mkdir(parents=True)
+            confirmed_path = review_dir / "task_1.txt"
+            confirmed_path.write_text(
+                "张三 计算机科学与技术 2023010001 思想汇报",
+                encoding="utf-8",
+            )
+
+            record = repo.add_material_file(
+                batch_id=batch["id"],
+                member_id=member["id"],
+                original_name="思想汇报扫描件.jpg",
+                stored_path="scan.jpg",
+                extension=".jpg",
+                parser_type="image",
+                parse_status="parsed",
+            )
+            repo.update_material_file(
+                record["id"],
+                material_type="思想汇报",
+                material_stage="activist",
+                recognition_source="filename_alias",
+                full_text_path=str(raw_path),
+                needs_review=1,
+                review_status="confirmed",
+            )
+            task = repo.create_ocr_task(
+                member_id=member["id"],
+                batch_id=batch["id"],
+                material_file_id=record["id"],
+                status="confirmed",
+                raw_segments_json='[{"text":"李四","confidence":0.42}]',
+                confidence_summary_json='{"segment_count":1,"low_confidence_count":1}',
+                confirmed_text_path=str(confirmed_path),
+            )
+            repo.update_material_file(
+                record["id"],
+                ocr_task_id=task["id"],
+                review_status="confirmed",
+            )
+
+            result = MaterialCheckService(repo).run_for_member(member["id"], batch["id"])
+            review_codes = [item["code"] for item in result["needs_review"]]
+
+            self.assertNotIn("identity_conflict", review_codes)
+            self.assertNotIn("unresolved_import_file", review_codes)
+        finally:
+            repo.close()
+            temp_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

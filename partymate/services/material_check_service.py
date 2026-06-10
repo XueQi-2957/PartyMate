@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from partymate.db.models import MATERIALS_PER_STAGE
 from partymate.db.repository import Repository
+from partymate.services.ocr_review_service import OCRReviewService
 
 
 class MaterialCheckService:
     def __init__(self, repo: Repository) -> None:
         self.repo = repo
+        self.ocr_reviews = OCRReviewService(repo)
 
     def run_for_member(
         self,
@@ -182,11 +183,10 @@ class MaterialCheckService:
         result: dict[str, Any],
     ) -> None:
         for item in files:
-            text_path = item.get("full_text_path")
-            if not text_path:
+            text = self.ocr_reviews.resolve_file_text(item)
+            if not text:
                 continue
 
-            text = Path(text_path).read_text(encoding="utf-8")
             if member.get("name") and member["name"] not in text:
                 result["needs_review"].append(
                     self._issue(
@@ -220,7 +220,9 @@ class MaterialCheckService:
         result: dict[str, Any],
     ) -> None:
         for item in files:
-            if item.get("needs_review"):
+            if item.get("review_status") == "confirmed":
+                continue
+            if item.get("review_status") == "review_required" or item.get("needs_review"):
                 result["needs_review"].append(
                     self._issue(
                         "unresolved_import_file",
