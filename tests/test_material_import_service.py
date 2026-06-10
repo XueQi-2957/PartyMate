@@ -104,3 +104,47 @@ class MaterialImportServiceClassificationTests(unittest.TestCase):
         finally:
             repo.close()
             temp_dir.cleanup()
+
+    @patch("partymate.services.material_import_service.parse_file")
+    def test_import_archive_creates_ocr_review_task_for_low_confidence_image(
+        self,
+        mock_parse,
+    ) -> None:
+        temp_dir, repo = make_temp_repo()
+        try:
+            member = repo.add_member(name="张三", student_id="2023010001")
+            zip_bytes = make_zip_bytes({"申请书扫描件.jpg": b"fake-image"})
+            mock_parse.return_value = {
+                "filename": "申请书扫描件.jpg",
+                "type": "image",
+                "text": "敬爱的党组只",
+                "pages": 1,
+                "preview": "敬爱的党组只",
+                "ocr_segments": [
+                    {
+                        "text": "敬爱的党组只",
+                        "confidence": 0.42,
+                        "bbox": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                    }
+                ],
+                "error": None,
+            }
+
+            service = MaterialImportService(repo=repo, data_root=Path(temp_dir.name))
+            result = service.import_archive(
+                member_id=member["id"],
+                archive_name="materials.zip",
+                archive_bytes=zip_bytes,
+            )
+
+            imported_file = result["files"][0]
+            self.assertEqual(imported_file["review_status"], "review_required")
+            self.assertTrue(imported_file["ocr_task_id"])
+
+            task = repo.get_ocr_task(imported_file["ocr_task_id"])
+            self.assertEqual(task["status"], "review_required")
+            self.assertIn("敬爱的党组只", task["raw_segments_json"])
+            self.assertIn("low_confidence_count", task["confidence_summary_json"])
+        finally:
+            repo.close()
+            temp_dir.cleanup()

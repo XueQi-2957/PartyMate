@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -99,6 +100,7 @@ class MaterialImportService:
                     Path(raw_name).name,
                     parsed.get("text", ""),
                 )
+                needs_review = needs_review or self._requires_ocr_review(parsed)
                 full_text_path = self._persist_parsed_text(
                     parsed_dir,
                     record["id"],
@@ -114,6 +116,28 @@ class MaterialImportService:
                     page_count=parsed.get("pages", 0),
                     needs_review=1 if needs_review else 0,
                 )
+                if updated["parser_type"] == "image" and updated.get("needs_review"):
+                    ocr_task = self.repo.create_ocr_task(
+                        member_id=member_id,
+                        batch_id=batch["id"],
+                        material_file_id=record["id"],
+                        status="review_required",
+                        raw_segments_json=json.dumps(
+                            parsed.get("ocr_segments", []),
+                            ensure_ascii=False,
+                        ),
+                        confidence_summary_json=json.dumps(
+                            self._build_confidence_summary(
+                                parsed.get("ocr_segments", []),
+                            ),
+                            ensure_ascii=False,
+                        ),
+                    )
+                    updated = self.repo.update_material_file(
+                        record["id"],
+                        ocr_task_id=ocr_task["id"],
+                        review_status="review_required",
+                    )
                 files.append(updated)
 
         recognized_files = sum(
@@ -168,6 +192,43 @@ class MaterialImportService:
         full_text_path = parsed_dir / f"file_{file_id}.txt"
         full_text_path.write_text(text, encoding="utf-8")
         return str(full_text_path)
+
+    def _build_confidence_summary(
+        self,
+        ocr_segments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        confidences = [
+            float(item.get("confidence", 0.0))
+            for item in ocr_segments
+            if item.get("confidence") is not None
+        ]
+        if not confidences:
+            return {
+                "segment_count": 0,
+                "low_confidence_count": 0,
+                "average_confidence": 0.0,
+                "min_confidence": 0.0,
+                "max_confidence": 0.0,
+            }
+        return {
+            "segment_count": len(confidences),
+            "low_confidence_count": sum(1 for item in confidences if item < 0.60),
+            "average_confidence": round(sum(confidences) / len(confidences), 4),
+            "min_confidence": min(confidences),
+            "max_confidence": max(confidences),
+        }
+
+    def _requires_ocr_review(self, parsed: dict[str, Any]) -> bool:
+        if parsed.get("type") != "image":
+            return False
+        text = "".join((parsed.get("text", "") or "").split())
+        if len(text) < 30:
+            return True
+        for item in parsed.get("ocr_segments", []):
+            confidence = item.get("confidence")
+            if confidence is not None and float(confidence) < 0.60:
+                return True
+        return False
 
     def _material_stage_map(self) -> dict[str, str]:
         mapping: dict[str, str] = {}
