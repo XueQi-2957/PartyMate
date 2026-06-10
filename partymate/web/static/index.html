@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.5">
+<title>PartyMate · 党务智能助手</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app">
+  <!-- ===== 顶栏 ===== -->
+  <header class="header">
+    <div class="header-inner">
+      <div class="header-left">
+        <div class="logo-mark">★</div>
+        <div class="logo-text">PartyMate</div>
+        <span class="logo-sub">党务智能助手</span>
+      </div>
+      <div class="header-right">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">检查连接...</span>
+        <span class="header-sep">|</span>
+        <span class="header-date" id="headerDate"></span>
+      </div>
+    </div>
+  </header>
+
+  <div class="main-wrap">
+    <!-- ===== 左侧导航 ===== -->
+    <nav class="sidebar" id="sidebar">
+      <div class="nav-section-label">工具</div>
+      <button class="nav-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">
+        <span class="nav-icon">🏠</span>
+        <span class="nav-label">首页</span>
+      </button>
+      <button class="nav-btn" data-tab="check-doc" onclick="switchTab('check-doc')">
+        <span class="nav-icon">📋</span>
+        <span class="nav-label">材料检查</span>
+      </button>
+      <button class="nav-btn" data-tab="meeting" onclick="switchTab('meeting')">
+        <span class="nav-icon">📝</span>
+        <span class="nav-label">会议整理</span>
+      </button>
+      <button class="nav-btn" data-tab="content" onclick="switchTab('content')">
+        <span class="nav-icon">📚</span>
+        <span class="nav-label">内容生成</span>
+      </button>
+      <button class="nav-btn" data-tab="chat" onclick="switchTab('chat')">
+        <span class="nav-icon">💬</span>
+        <span class="nav-label">AI 对话</span>
+      </button>
+      <button class="nav-btn" data-tab="kanban" onclick="switchTab('kanban')">
+        <span class="nav-icon">📊</span>
+        <span class="nav-label">发展看板</span>
+      </button>
+      <div class="nav-footer">
+        <div class="nav-version" id="versionDisplay">v1.3.0</div>
+      </div>
+    </nav>
+
+    <!-- ===== 主内容区 ===== -->
+    <main class="content" id="mainContent">
+
+      <!-- ========== 首页 Dashboard ========== -->
+      <section class="tab-pane active" id="pane-dashboard">
+        <div class="pane-header">
+          <h2>🏠 PartyMate 党务智能助手</h2>
+          <p class="pane-desc">发展党员材料检查 · 会议记录整理 · 三会一课内容生成</p>
+        </div>
+
+        <!-- 统计卡片 -->
+        <div class="dashboard-grid">
+          <div class="stat-card">
+            <div class="stat-icon">📋</div>
+            <div class="stat-value" id="statChecks">-</div>
+            <div class="stat-label">材料检查次数</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">📝</div>
+            <div class="stat-value" id="statMeetings">-</div>
+            <div class="stat-label">会议整理次数</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon">📄</div>
+            <div class="stat-value" id="statFiles">-</div>
+            <div class="stat-label">已处理文件</div>
+          </div>
+        </div>
+
+        <!-- 快速入口 -->
+        <div class="quick-links">
+          <div class="quick-link-card" onclick="switchTab('check-doc')">
+            <div class="quick-link-icon">📋</div>
+            <div class="quick-link-info">
+              <div class="quick-link-title">材料合规检查</div>
+              <div class="quick-link-desc">检查入党申请书、思想汇报、转正申请等</div>
+            </div>
+          </div>
+          <div class="quick-link-card" onclick="switchTab('meeting')">
+            <div class="quick-link-icon">📝</div>
+            <div class="quick-link-info">
+              <div class="quick-link-title">会议记录整理</div>
+              <div class="quick-link-desc">整理为结构化会议纪要，支持 Word 导出</div>
+            </div>
+          </div>
+          <div class="quick-link-card" onclick="switchTab('content')">
+            <div class="quick-link-icon">📚</div>
+            <div class="quick-link-info">
+              <div class="quick-link-title">三会一课内容生成</div>
+              <div class="quick-link-desc">生成学习材料、PPT 大纲与讨论题目</div>
+            </div>
+          </div>
+          <div class="quick-link-card" onclick="switchTab('chat')">
+            <div class="quick-link-icon">💬</div>
+            <div class="quick-link-info">
+              <div class="quick-link-title">AI 智能对话</div>
+              <div class="quick-link-desc">自然语言交互，调用全部工具能力</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 最近文件 -->
+        <div class="recent-files">
+          <div class="recent-files-header">
+            <span>📁 最近处理文件</span>
+            <span class="field-hint" id="recentCount"></span>
+          </div>
+          <div class="recent-files-body" id="recentFilesBody">
+            <div class="recent-file-empty">暂无文件记录，开始使用后会自动保存</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========== 材料检查 (双栏布局) ========== -->
+      <section class="tab-pane" id="pane-check-doc">
+        <div class="pane-header">
+          <h2>📋 发展党员材料合规检查</h2>
+          <p class="pane-desc">上传入党申请书、思想汇报、转正申请等材料，自动检查格式与内容规范，引用规程依据</p>
+        </div>
+
+        <!-- 文件上传 Dropzone -->
+        <div class="card">
+          <div class="card-body">
+            <div class="dropzone" id="checkDropzone"
+                 ondragover="event.preventDefault(); this.classList.add('dragover')"
+                 ondragleave="this.classList.remove('dragover')"
+                 ondrop="handleCheckDrop(event)"
+                 onclick="document.getElementById('checkFileInput').click()">
+              <div class="dropzone-icon">📄</div>
+              <div class="dropzone-text">点击或拖拽文件到此处</div>
+              <div class="dropzone-hint">支持 PDF · Word · 图片 (OCR)</div>
+              <div class="dropzone-formats">.pdf .docx .png .jpg 等</div>
+              <input type="file" id="checkFileInput" accept=".pdf,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tiff" onchange="handleCheckFileSelect(event)">
+            </div>
+            <div id="checkFileInfo" style="display:none"></div>
+
+            <!-- 快捷：粘贴文本入口（折叠） -->
+            <details style="margin-top:12px">
+              <summary style="font-size:12px;color:var(--text-dim);cursor:pointer">或直接粘贴全文</summary>
+              <textarea class="field-textarea" id="checkDocInput" rows="5"
+                placeholder="粘贴材料全文（备用方案，推荐使用文件上传）"
+                style="margin-top:8px"></textarea>
+              <div class="field-actions" style="margin-top:8px">
+                <button class="btn btn-primary" onclick="runCheckDoc()">🔍 开始检查</button>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <!-- 双栏结果区 -->
+        <div class="split-layout" id="checkSplitResult" style="display:none">
+          <!-- 左侧：材料预览 -->
+          <div class="split-panel">
+            <div class="split-panel-header">
+              <span>📄 材料原文</span>
+              <span class="field-hint" id="checkPreviewMeta"></span>
+            </div>
+            <div class="split-panel-body">
+              <pre id="checkPreviewBody">等待检查...</pre>
+            </div>
+          </div>
+          <!-- 右侧：检查结果 + 规程引用 -->
+          <div class="split-panel">
+            <div class="split-panel-header">
+              <span>🔍 检查结果与建议</span>
+              <button class="btn btn-sm" onclick="copyResult('checkSplitResult')">📋 复制</button>
+            </div>
+            <div class="split-panel-body" id="checkResultsBody">
+              <div style="color:var(--text-dim);padding:20px;text-align:center">上传文件后自动检查，请稍候...</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 旧的结果卡片（备用） -->
+        <div class="result-card" id="checkDocResult" style="display:none">
+          <div class="result-header">
+            <h3>检查结果</h3>
+            <button class="btn btn-sm" onclick="copyResult('checkDocResult')">📋 复制</button>
+          </div>
+          <pre class="result-body" id="checkDocBody"></pre>
+        </div>
+      </section>
+
+      <!-- ========== 会议整理 ========== -->
+      <section class="tab-pane" id="pane-meeting">
+        <div class="pane-header">
+          <h2>📝 会议记录整理</h2>
+          <p class="pane-desc">上传会议记录文档或粘贴原文，整理为结构化会议纪要，支持导出 Word</p>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <!-- 文件上传 -->
+            <div class="dropzone" id="meetingDropzone"
+                 ondragover="event.preventDefault(); this.classList.add('dragover')"
+                 ondragleave="this.classList.remove('dragover')"
+                 ondrop="handleMeetingDrop(event)"
+                 onclick="document.getElementById('meetingFileInput').click()">
+              <div class="dropzone-icon">📄</div>
+              <div class="dropzone-text">上传会议记录文件（PDF / Word / 图片）</div>
+              <div class="dropzone-hint">支持文件解析后自动填充</div>
+              <input type="file" id="meetingFileInput" accept=".pdf,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tiff" onchange="handleMeetingFileSelect(event)">
+            </div>
+            <div id="meetingFileInfo" style="display:none"></div>
+
+            <label class="field-label" style="margin-top:14px">或直接粘贴会议记录</label>
+            <textarea class="field-textarea" id="meetingInput" rows="8"
+              placeholder="粘贴会议记录原文...
+
+格式参考：
+时间：2024年6月1日
+主持人：李书记
+记录人：小王
+出席：15人
+会议类型：支委会
+议题一：讨论发展对象名单
+议题二：七一活动方案
+下一步工作：小王负责起草方案，需在6月15日前完成"></textarea>
+            <div class="field-actions">
+              <button class="btn btn-primary" onclick="runMeeting()">📊 整理纪要</button>
+              <button class="btn btn-secondary" onclick="runMeeting({exportDocx:true})" id="meetingExportBtn">📝 整理 + 导出 Word</button>
+            </div>
+          </div>
+        </div>
+        <div class="result-card" id="meetingResult" style="display:none">
+          <div class="result-header">
+            <h3>会议纪要</h3>
+            <div class="result-actions">
+              <button class="btn btn-sm" onclick="copyResult('meetingResult')">📋 复制</button>
+              <button class="btn btn-sm btn-gold" id="meetingDownloadBtn" style="display:none" onclick="downloadFile(this.dataset.path)">📝 下载 Word</button>
+            </div>
+          </div>
+          <pre class="result-body" id="meetingBody"></pre>
+        </div>
+      </section>
+
+      <!-- ========== 内容生成 ========== -->
+      <section class="tab-pane" id="pane-content">
+        <div class="pane-header">
+          <h2>📚 三会一课内容生成</h2>
+          <p class="pane-desc">根据主题生成学习材料、PPT 大纲和讨论题目，支持导出 PPT</p>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <label class="field-label">学习 / 党课主题</label>
+            <input class="field-input" id="contentTopic" type="text"
+              placeholder="例如：党纪学习教育、学习二十大精神、新质生产力、中央八项规定..."
+              value="党纪学习教育">
+            <div class="field-actions">
+              <button class="btn btn-primary" onclick="runContent()">📚 生成方案</button>
+              <button class="btn btn-secondary" onclick="runContent({exportPptx:true})" id="contentExportBtn">📊 生成 + 导出 PPT</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 结果 + 规程引用 -->
+        <div class="result-card" id="contentResult" style="display:none">
+          <div class="result-header">
+            <h3>📚 内容方案</h3>
+            <div class="result-actions">
+              <button class="btn btn-sm" onclick="copyResult('contentResult')">📋 复制</button>
+              <button class="btn btn-sm btn-gold" id="contentDownloadBtn" style="display:none" onclick="downloadFile(this.dataset.path)">📊 下载 PPT</button>
+            </div>
+          </div>
+          <pre class="result-body" id="contentBody"></pre>
+        </div>
+        <div class="result-card" id="contentCitations" style="display:none">
+          <div class="result-header"><h3>📖 相关规程依据</h3></div>
+          <pre class="result-body" id="contentCitationsBody"></pre>
+        </div>
+      </section>
+
+      <!-- ========== AI 对话 ========== -->
+      <section class="tab-pane" id="pane-chat">
+        <div class="pane-header">
+          <h2>💬 AI 对话</h2>
+          <p class="pane-desc">用自然语言与 PartyMate AI 交流，支持上传文件解析后发送</p>
+        </div>
+        <div class="card chat-card">
+          <div class="chat-messages" id="chatMessages">
+            <div class="msg msg-ai">
+              <div class="msg-avatar">🤖</div>
+              <div class="msg-bubble">
+                <strong>你好！我是 PartyMate 党务智能助手</strong><br><br>
+                📎 支持上传文件：点击下方 📂 按钮上传 PDF/Word/图片<br>
+                📋 让我检查一份党员材料<br>
+                📝 整理会议记录<br>
+                📚 生成党课内容
+              </div>
+            </div>
+          </div>
+          <!-- 文件上传条（嵌入聊天） -->
+          <div class="chat-upload-row">
+            <button class="chat-upload-btn" onclick="document.getElementById('chatFileInput').click()">📂 上传文件解析</button>
+            <span id="chatFileLabel"></span>
+            <input type="file" id="chatFileInput" accept=".pdf,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tiff"
+                   style="display:none" onchange="handleChatFileSelect(event)">
+          </div>
+          <div class="chat-input-row">
+            <input class="chat-input" id="chatInput" type="text"
+              placeholder="输入你的问题，或上传文件后询问..."
+              onkeydown="if(event.key==='Enter') sendChat()">
+            <button class="btn btn-primary chat-send" onclick="sendChat()">发送</button>
+          </div>
+          <div class="chat-status" id="chatStatus"></div>
+        </div>
+      </section>
+
+      <!-- ========== 📊 发展看板 Kanban ========== -->
+      <section class="tab-pane" id="pane-kanban">
+        <div class="pane-header">
+          <h2>📊 发展看板</h2>
+          <p class="pane-desc">发展党员全流程管理 · 阶段看板 · 材料跟踪 · 提醒</p>
+        </div>
+
+        <!-- Error display -->
+        <div id="kanbanError" class="kanban-error" style="display:none"></div>
+
+        <!-- Stage summary bar -->
+        <div class="stage-summary" id="stageSummary"></div>
+
+        <!-- 3-column kanban layout -->
+        <div class="kanban-layout">
+          <!-- Left: member list grouped by stage -->
+          <div class="kanban-left">
+            <div class="kanban-panel-header">
+              <span>👥 成员列表</span>
+              <div class="kanban-actions">
+                <button class="btn btn-sm" onclick="document.getElementById('csvFileInput').click()">📥 批量导入</button>
+                <button class="btn btn-sm btn-gold" onclick="showAddMemberModal()">＋ 添加</button>
+                <input type="file" id="csvFileInput" accept=".csv" style="display:none" onchange="handleCsvImport(event)">
+              </div>
+            </div>
+            <div class="kanban-panel-body" id="kanbanMemberList">
+              <div class="loading" style="padding:20px;text-align:center">加载中...</div>
+            </div>
+          </div>
+
+          <!-- Center: member detail -->
+          <div class="kanban-center">
+            <div class="kanban-panel-header">
+              <span>📋 成员详情</span>
+            </div>
+            <div class="kanban-panel-body" id="kanbanMemberDetail">
+              <div style="color:var(--text-dim);padding:30px;text-align:center;font-size:13px">
+                点击左侧成员查看详细信息
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: reminders -->
+          <div class="kanban-right">
+            <div class="kanban-panel-header">
+              <span>🔔 提醒事项</span>
+            </div>
+            <div class="kanban-panel-body" id="kanbanReminders">
+              <div class="loading" style="padding:20px;text-align:center">加载中...</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<!-- ===== Add Member Modal ===== -->
+<div class="modal-overlay" id="addMemberModal" style="display:none" onclick="if(event.target===this)hideAddMemberModal()">
+  <div class="modal-dialog">
+    <div class="modal-header">
+      <span>➕ 添加新成员</span>
+      <button class="modal-close" onclick="hideAddMemberModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <label class="field-label">姓名</label>
+      <input class="field-input" id="newMemberName" type="text" placeholder="请输入姓名" style="margin-bottom:12px">
+      <label class="field-label">当前阶段</label>
+      <select class="field-input" id="newMemberStage" style="margin-bottom:12px">
+        <option value="applicant">申请入党</option>
+        <option value="activist">入党积极分子</option>
+        <option value="candidate">发展对象</option>
+        <option value="probationary">预备党员</option>
+        <option value="full_member">正式党员</option>
+      </select>
+      <label class="field-label">备注</label>
+      <textarea class="field-textarea" id="newMemberNotes" rows="3" placeholder="可选备注信息"></textarea>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="hideAddMemberModal()">取消</button>
+      <button class="btn btn-primary" onclick="addMember()">确认添加</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="memberArchiveInput" accept=".zip" style="display:none" onchange="handleMemberArchiveSelected(event)">
+
+<script src="app.js"></script>
+</body>
+</html>
