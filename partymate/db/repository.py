@@ -212,6 +212,8 @@ class Repository:
                     recognition_source TEXT DEFAULT '',
                     text_excerpt TEXT DEFAULT '',
                     full_text_path TEXT DEFAULT '',
+                    ocr_task_id INTEGER DEFAULT NULL,
+                    review_status TEXT DEFAULT '',
                     page_count INTEGER NOT NULL DEFAULT 0,
                     needs_review INTEGER NOT NULL DEFAULT 0,
                     error_message TEXT DEFAULT '',
@@ -229,7 +231,31 @@ class Repository:
                     summary_json TEXT NOT NULL,
                     created_at TEXT DEFAULT (datetime('now','localtime'))
                 );
+
+                CREATE TABLE IF NOT EXISTS ocr_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    member_id INTEGER NOT NULL REFERENCES members(id),
+                    batch_id INTEGER NOT NULL REFERENCES material_import_batches(id),
+                    material_file_id INTEGER NOT NULL UNIQUE REFERENCES material_files(id),
+                    status TEXT NOT NULL,
+                    raw_segments_json TEXT NOT NULL,
+                    confidence_summary_json TEXT NOT NULL,
+                    confirmed_text_path TEXT DEFAULT '',
+                    review_notes TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at TEXT DEFAULT (datetime('now','localtime'))
+                );
             """)
+            self._ensure_column(
+                "material_files",
+                "ocr_task_id",
+                "INTEGER DEFAULT NULL",
+            )
+            self._ensure_column(
+                "material_files",
+                "review_status",
+                "TEXT DEFAULT ''",
+            )
 
     # ── Members ─────────────────────────────────────────────
 
@@ -588,6 +614,84 @@ class Repository:
         ).fetchall()
         return _rows_to_dicts(rows)
 
+    # ── OCR Review Tasks ───────────────────────────────────
+
+    def create_ocr_task(
+        self,
+        member_id: int,
+        batch_id: int,
+        material_file_id: int,
+        status: str,
+        raw_segments_json: str,
+        confidence_summary_json: str,
+        confirmed_text_path: str = "",
+        review_notes: str = "",
+    ) -> dict[str, Any]:
+        cursor = self.conn.execute(
+            """INSERT INTO ocr_tasks
+               (member_id, batch_id, material_file_id, status, raw_segments_json,
+                confidence_summary_json, confirmed_text_path, review_notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                member_id,
+                batch_id,
+                material_file_id,
+                status,
+                raw_segments_json,
+                confidence_summary_json,
+                confirmed_text_path,
+                review_notes,
+            ),
+        )
+        self.conn.commit()
+        return self.get_ocr_task(int(cursor.lastrowid))
+
+    def get_ocr_task(self, task_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM ocr_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+    def update_ocr_task(self, task_id: int, **kwargs: Any) -> dict[str, Any]:
+        if not kwargs:
+            return self.get_ocr_task(task_id)
+        sets = []
+        params: list[Any] = []
+        for key, value in kwargs.items():
+            sets.append(f"{key} = ?")
+            params.append(value)
+        sets.append("updated_at = ?")
+        params.append(_now_str())
+        params.append(task_id)
+        self.conn.execute(
+            f"UPDATE ocr_tasks SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        self.conn.commit()
+        return self.get_ocr_task(task_id)
+
+    def list_member_ocr_tasks(
+        self,
+        member_id: int,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        parts = ["SELECT * FROM ocr_tasks WHERE member_id = ?"]
+        params: list[Any] = [member_id]
+        if status:
+            parts.append("AND status = ?")
+            params.append(status)
+        parts.append("ORDER BY created_at DESC, id DESC")
+        rows = self.conn.execute(" ".join(parts), params).fetchall()
+        return _rows_to_dicts(rows)
+
+    def get_ocr_task_by_material_file(self, material_file_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM ocr_tasks WHERE material_file_id = ?",
+            (material_file_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
     # ── Material Check Results ─────────────────────────────
 
     def create_member_material_check(
@@ -746,6 +850,18 @@ class Repository:
                    VALUES (?, ?, ?, 1)""",
                 (member_id, mat_name, stage),
             )
+        self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in columns:
+            return
+        self.conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
         self.conn.commit()
 
     def close(self) -> None:
