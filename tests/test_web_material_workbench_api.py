@@ -199,6 +199,84 @@ class MaterialWorkbenchApiTests(unittest.TestCase):
             repo.close()
             temp_dir.cleanup()
 
+    @patch("partymate.services.material_import_service.parse_file")
+    def test_import_confirm_ocr_then_check_flow_clears_unresolved_review_issue(
+        self,
+        mock_parse,
+    ) -> None:
+        temp_dir, repo = make_temp_repo()
+        try:
+            member = repo.add_member(
+                name="张三",
+                major="计算机科学与技术",
+                student_id="2023010001",
+            )
+            mock_parse.return_value = {
+                "filename": "思想汇报扫描件.jpg",
+                "type": "image",
+                "text": "李四 软件工程 2023010001 思想汇报",
+                "pages": 1,
+                "preview": "李四 软件工程 2023010001 思想汇报",
+                "ocr_segments": [
+                    {
+                        "text": "李四 软件工程 2023010001 思想汇报",
+                        "confidence": 0.42,
+                        "bbox": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                    }
+                ],
+                "error": None,
+            }
+            app = create_app(repository=repo, data_root=Path(temp_dir.name))
+            zip_bytes = make_zip_bytes({"思想汇报扫描件.jpg": b"fake-image"})
+
+            with TestClient(app) as client:
+                import_resp = client.post(
+                    "/api/materials/archive/import",
+                    files={"file": ("materials.zip", zip_bytes, "application/zip")},
+                    data={"member_id": str(member["id"])},
+                )
+                self.assertEqual(import_resp.status_code, 200)
+                imported_file = import_resp.json()["files"][0]
+                self.assertEqual(imported_file["review_status"], "review_required")
+
+                first_check = client.post(
+                    f"/api/members/{member['id']}/materials/check",
+                    json={},
+                )
+                self.assertEqual(first_check.status_code, 200)
+                first_review_codes = {
+                    item["code"] for item in first_check.json()["needs_review"]
+                }
+                self.assertIn("unresolved_import_file", first_review_codes)
+                self.assertIn("identity_conflict", first_review_codes)
+
+                task_resp = client.get(f"/api/ocr/tasks/{imported_file['ocr_task_id']}")
+                self.assertEqual(task_resp.status_code, 200)
+
+                confirm_resp = client.post(
+                    "/api/ocr/confirm",
+                    json={
+                        "task_id": imported_file["ocr_task_id"],
+                        "confirmed_text": "张三 计算机科学与技术 2023010001 思想汇报",
+                        "review_notes": "修正姓名与专业字段",
+                    },
+                )
+                self.assertEqual(confirm_resp.status_code, 200)
+
+                second_check = client.post(
+                    f"/api/members/{member['id']}/materials/check",
+                    json={},
+                )
+                self.assertEqual(second_check.status_code, 200)
+                second_review_codes = {
+                    item["code"] for item in second_check.json()["needs_review"]
+                }
+                self.assertNotIn("unresolved_import_file", second_review_codes)
+                self.assertNotIn("identity_conflict", second_review_codes)
+        finally:
+            repo.close()
+            temp_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()
