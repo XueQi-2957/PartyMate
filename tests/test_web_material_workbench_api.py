@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+import io
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from starlette.testclient import TestClient
 
+from partymate.web import server
 from partymate.web.server import create_app
 from tests.support import make_temp_repo, make_zip_bytes
 
 
 class MaterialWorkbenchApiTests(unittest.TestCase):
+    def test_emit_startup_banner_handles_gbk_stdout(self) -> None:
+        class GbkConsole(io.StringIO):
+            encoding = "gbk"
+
+            def write(self, s: str) -> int:
+                s.encode(self.encoding)
+                return super().write(s)
+
+        console = GbkConsole()
+
+        server._emit_startup_banner(console)
+
+        output = console.getvalue()
+        self.assertIn("PartyMate Web", output)
+        self.assertIn("http://localhost:8567", output)
+
     @patch("partymate.services.material_import_service.parse_file")
     def test_import_endpoint_saves_member_archive_batch(self, mock_parse) -> None:
         temp_dir, repo = make_temp_repo()

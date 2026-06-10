@@ -45,6 +45,29 @@ def _ensure_upload_dir() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _emit_startup_banner(stream=None) -> None:
+    target = stream or sys.stdout
+    encoding = getattr(target, "encoding", None) or "utf-8"
+    lines = [
+        "PartyMate Web 界面启动: http://localhost:8567",
+        f"支持文件格式: {', '.join(SUPPORTED_EXTS)}",
+        f"导出目录: {OUTPUT_DIR}",
+        f"上传目录: {UPLOAD_DIR}",
+    ]
+    for line in lines:
+        try:
+            target.write(f"{line}\n")
+        except UnicodeEncodeError:
+            safe_line = line.encode(encoding, errors="replace").decode(
+                encoding,
+                errors="replace",
+            )
+            target.write(f"{safe_line}\n")
+    flush = getattr(target, "flush", None)
+    if callable(flush):
+        flush()
+
+
 def create_app(
     repository: Repository | None = None,
     data_root: Path | None = None,
@@ -387,8 +410,5 @@ app = create_app()
 if __name__ == "__main__":  # pragma: no cover - manual run path
     import uvicorn
 
-    print("🚀 PartyMate Web 界面启动: http://localhost:8567")
-    print(f"📁 支持文件格式: {', '.join(SUPPORTED_EXTS)}")
-    print(f"📂 导出目录: {OUTPUT_DIR}")
-    print(f"📤 上传目录: {UPLOAD_DIR}")
+    _emit_startup_banner()
     uvicorn.run(app, host="0.0.0.0", port=8567, log_level="info")
