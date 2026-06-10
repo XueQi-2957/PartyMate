@@ -4,7 +4,9 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from partymate.db.models import DOC_TYPE_TO_STAGE, MATERIAL_NAME_ALIASES, MATERIALS_PER_STAGE
 from partymate.db.repository import Repository
+from partymate.tools.doc_check import detect_doc_type
 from partymate.tools.file_parser import SUPPORTED_EXTS, parse_file
 
 
@@ -83,17 +85,48 @@ class MaterialImportService:
                     parser_type=parsed.get("type", "unknown"),
                     parse_status="parsed" if not parsed.get("error") else "error",
                 )
-                files.append(record)
                 if parsed.get("error"):
+                    updated = self.repo.update_material_file(
+                        record["id"],
+                        error_message=parsed["error"],
+                        needs_review=1,
+                    )
+                    files.append(updated)
                     failed_files.append(Path(raw_name).name)
+                    continue
 
+                material_type, material_stage, recognition_source, needs_review = self._identify_material(
+                    Path(raw_name).name,
+                    parsed.get("text", ""),
+                )
+                full_text_path = self._persist_parsed_text(
+                    parsed_dir,
+                    record["id"],
+                    parsed.get("text", ""),
+                )
+                updated = self.repo.update_material_file(
+                    record["id"],
+                    material_type=material_type,
+                    material_stage=material_stage,
+                    recognition_source=recognition_source,
+                    text_excerpt=parsed.get("preview", ""),
+                    full_text_path=full_text_path,
+                    page_count=parsed.get("pages", 0),
+                    needs_review=1 if needs_review else 0,
+                )
+                files.append(updated)
+
+        recognized_files = sum(
+            1 for item in files if item.get("material_type") not in ("", "unknown")
+        )
+        needs_review_files = sum(1 for item in files if item.get("needs_review"))
         batch = self.repo.update_material_import_batch(
             batch["id"],
             total_files=len(files),
             failed_files=len(failed_files),
-            recognized_files=0,
-            needs_review_files=0,
-            status="completed",
+            recognized_files=recognized_files,
+            needs_review_files=needs_review_files,
+            status="completed_with_review" if needs_review_files else "completed",
         )
 
         return {
@@ -102,3 +135,43 @@ class MaterialImportService:
             "skipped_files": skipped_files,
             "failed_files": failed_files,
         }
+
+    def _identify_material(
+        self,
+        original_name: str,
+        parsed_text: str,
+    ) -> tuple[str, str, str, bool]:
+        normalized_name = original_name.lower()
+        stage_map = self._material_stage_map()
+
+        for material_name, stage in stage_map.items():
+            if material_name.lower() in normalized_name:
+                return material_name, stage, "filename_exact", False
+
+        for material_name, aliases in MATERIAL_NAME_ALIASES.items():
+            if any(alias.lower() in normalized_name for alias in aliases):
+                return (
+                    material_name,
+                    DOC_TYPE_TO_STAGE.get(material_name, stage_map.get(material_name, "")),
+                    "filename_alias",
+                    False,
+                )
+
+        doc_type = detect_doc_type(parsed_text or "")
+        if doc_type:
+            return doc_type, DOC_TYPE_TO_STAGE.get(doc_type, ""), "content_doc_type", False
+
+        needs_review = len("".join((parsed_text or "").split())) < 30
+        return "unknown", "", "unknown", needs_review
+
+    def _persist_parsed_text(self, parsed_dir: Path, file_id: int, text: str) -> str:
+        full_text_path = parsed_dir / f"file_{file_id}.txt"
+        full_text_path.write_text(text, encoding="utf-8")
+        return str(full_text_path)
+
+    def _material_stage_map(self) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for stage, materials in MATERIALS_PER_STAGE.items():
+            for material_name in materials:
+                mapping.setdefault(material_name, stage)
+        return mapping
