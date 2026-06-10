@@ -115,7 +115,9 @@ class Repository:
 
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = db_path or _get_db_path()
-        self.conn = sqlite3.connect(self.db_path)
+        # Starlette TestClient may handle requests on a different thread from
+        # the one that created the injected repository.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.create_tables()
