@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from starlette.testclient import TestClient
 
@@ -159,6 +159,109 @@ class MaterialWorkbenchApiTests(unittest.TestCase):
             self.assertIn("total", dashboard.json())
             self.assertIn("stages", dashboard.json())
             self.assertIn("timeline", detail.json()["member"])
+        finally:
+            repo.close()
+            temp_dir.cleanup()
+
+    def test_member_memory_endpoints_support_crud_and_merge(self) -> None:
+        temp_dir, repo = make_temp_repo()
+        try:
+            member = repo.add_member(name="张三")
+            app = create_app(repository=repo, data_root=Path(temp_dir.name))
+            with TestClient(app) as client:
+                create_one = client.post(
+                    f"/api/members/{member['id']}/memories",
+                    json={
+                        "kind": "risk",
+                        "title": "政审提醒",
+                        "content": "政审材料需要重点跟进。",
+                        "importance": 3,
+                        "pinned": True,
+                    },
+                )
+                create_two = client.post(
+                    f"/api/members/{member['id']}/memories",
+                    json={
+                        "kind": "note",
+                        "title": "补充观察",
+                        "content": "提交材料节奏偏慢。",
+                        "importance": 2,
+                    },
+                )
+                listed = client.get(f"/api/members/{member['id']}/memories")
+
+                memory_one_id = create_one.json()["memory"]["id"]
+                memory_two_id = create_two.json()["memory"]["id"]
+                patched = client.patch(
+                    f"/api/members/{member['id']}/memories/{memory_two_id}",
+                    json={"pinned": True, "title": "已更新观察"},
+                )
+                merged = client.post(
+                    f"/api/members/{member['id']}/memories/merge",
+                    json={
+                        "memory_ids": [memory_one_id, memory_two_id],
+                        "kind": "summary",
+                        "title": "合并结论",
+                        "content": "政审材料和提交节奏都需持续跟进。",
+                        "importance": 3,
+                        "pinned": True,
+                    },
+                )
+                deleted = client.delete(
+                    f"/api/members/{member['id']}/memories/{memory_one_id}"
+                )
+                active_after = client.get(f"/api/members/{member['id']}/memories")
+
+            self.assertEqual(create_one.status_code, 200)
+            self.assertEqual(create_two.status_code, 200)
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual(len(listed.json()["memories"]), 2)
+            self.assertEqual(patched.status_code, 200)
+            self.assertEqual(patched.json()["memory"]["pinned"], 1)
+            self.assertEqual(merged.status_code, 200)
+            self.assertEqual(merged.json()["memory"]["kind"], "summary")
+            self.assertEqual(deleted.status_code, 200)
+            self.assertEqual(active_after.status_code, 200)
+            self.assertEqual(len(active_after.json()["memories"]), 1)
+        finally:
+            repo.close()
+            temp_dir.cleanup()
+
+    @patch("partymate.agent.run_agent", new_callable=AsyncMock)
+    def test_chat_endpoint_passes_member_context_when_member_id_present(
+        self,
+        mock_run_agent,
+    ) -> None:
+        temp_dir, repo = make_temp_repo()
+        try:
+            member = repo.add_member(
+                name="张三",
+                major="计算机科学与技术",
+                student_id="2023010001",
+            )
+            repo.create_member_memory(
+                member_id=member["id"],
+                kind="instruction",
+                title="提醒",
+                content="思想汇报需重点关注时政结合部分。",
+                importance=3,
+                pinned=1,
+                source="manual",
+            )
+            mock_run_agent.return_value = "ok"
+            app = create_app(repository=repo, data_root=Path(temp_dir.name))
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/chat",
+                    json={"message": "请给出下一步建议", "member_id": member["id"]},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["result"], "ok")
+            self.assertEqual(mock_run_agent.await_args.args[0], "请给出下一步建议")
+            member_context = mock_run_agent.await_args.kwargs["member_context"]
+            self.assertIn("成员姓名: 张三", member_context)
+            self.assertIn("思想汇报需重点关注时政结合部分。", member_context)
         finally:
             repo.close()
             temp_dir.cleanup()

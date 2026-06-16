@@ -98,6 +98,40 @@ class MemberViewServiceTests(unittest.TestCase):
             repo.close()
             temp_dir.cleanup()
 
+    def test_build_member_detail_includes_active_memories(self) -> None:
+        temp_dir, repo = make_temp_repo()
+        try:
+            member = repo.add_member(name="张三")
+            repo.create_member_memory(
+                member_id=member["id"],
+                kind="instruction",
+                title="提醒事项",
+                content="优先核对思想汇报时间线。",
+                importance=3,
+                pinned=1,
+                source="manual",
+            )
+            repo.create_member_memory(
+                member_id=member["id"],
+                kind="note",
+                title="已合并旧记录",
+                content="旧记忆不再显示",
+                importance=1,
+                pinned=0,
+                source="manual",
+                merged_into_id=1,
+            )
+
+            detail = MemberViewService(repo).build_member_detail(member["id"])
+
+            self.assertIn("memories", detail)
+            self.assertEqual(detail["memory_count"], 1)
+            self.assertEqual(detail["pinned_memory_count"], 1)
+            self.assertEqual(detail["memories"][0]["title"], "提醒事项")
+        finally:
+            repo.close()
+            temp_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

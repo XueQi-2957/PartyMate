@@ -245,6 +245,76 @@ class Repository:
                     created_at TEXT DEFAULT (datetime('now','localtime')),
                     updated_at TEXT DEFAULT (datetime('now','localtime'))
                 );
+
+                CREATE TABLE IF NOT EXISTS member_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    member_id INTEGER NOT NULL REFERENCES members(id),
+                    kind TEXT NOT NULL,
+                    title TEXT DEFAULT '',
+                    content TEXT NOT NULL,
+                    importance INTEGER NOT NULL DEFAULT 2,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    source TEXT DEFAULT '',
+                    merged_into_id INTEGER DEFAULT NULL REFERENCES member_memories(id),
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL UNIQUE,
+                    member_id INTEGER DEFAULT NULL REFERENCES members(id),
+                    user_input TEXT NOT NULL,
+                    tool_calls_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    model_used TEXT DEFAULT '',
+                    result_summary TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_run_tool_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL REFERENCES agent_runs(run_id),
+                    tool_name TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL DEFAULT '{}',
+                    result_summary TEXT DEFAULT '',
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    call_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS meeting_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_title TEXT DEFAULT '',
+                    action_text TEXT NOT NULL,
+                    responsible_person TEXT DEFAULT '',
+                    due_date TEXT DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    member_id INTEGER DEFAULT NULL REFERENCES members(id),
+                    reminder_id INTEGER DEFAULT NULL REFERENCES reminders(id),
+                    source_meeting_id TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT DEFAULT '',
+                    member_id INTEGER DEFAULT NULL REFERENCES members(id),
+                    message_count INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    tool_calls_json TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now','localtime'))
+                );
             """)
             self._ensure_column(
                 "material_files",
@@ -692,6 +762,85 @@ class Repository:
         ).fetchone()
         return _row_to_dict(row)
 
+    # ── Member Memories ────────────────────────────────────
+
+    def create_member_memory(
+        self,
+        member_id: int,
+        kind: str,
+        title: str,
+        content: str,
+        importance: int = 2,
+        pinned: int = 0,
+        source: str = "",
+        merged_into_id: int | None = None,
+    ) -> dict[str, Any]:
+        cursor = self.conn.execute(
+            """INSERT INTO member_memories
+               (member_id, kind, title, content, importance, pinned, source, merged_into_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                member_id,
+                kind,
+                title,
+                content,
+                importance,
+                pinned,
+                source,
+                merged_into_id,
+            ),
+        )
+        self.conn.commit()
+        return self.get_member_memory(int(cursor.lastrowid))
+
+    def get_member_memory(self, memory_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM member_memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+    def list_member_memories(
+        self,
+        member_id: int,
+        include_merged: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        parts = ["SELECT * FROM member_memories WHERE member_id = ?"]
+        params: list[Any] = [member_id]
+        if not include_merged:
+            parts.append("AND merged_into_id IS NULL")
+        parts.append("ORDER BY pinned DESC, updated_at DESC, id DESC LIMIT ?")
+        params.append(limit)
+        rows = self.conn.execute(" ".join(parts), params).fetchall()
+        return _rows_to_dicts(rows)
+
+    def update_member_memory(self, memory_id: int, **kwargs: Any) -> dict[str, Any]:
+        if not kwargs:
+            return self.get_member_memory(memory_id)
+        sets = []
+        params: list[Any] = []
+        for key, value in kwargs.items():
+            sets.append(f"{key} = ?")
+            params.append(value)
+        sets.append("updated_at = ?")
+        params.append(_now_str())
+        params.append(memory_id)
+        self.conn.execute(
+            f"UPDATE member_memories SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        self.conn.commit()
+        return self.get_member_memory(memory_id)
+
+    def delete_member_memory(self, memory_id: int) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM member_memories WHERE id = ?",
+            (memory_id,),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     # ── Material Check Results ─────────────────────────────
 
     def create_member_material_check(
@@ -779,8 +928,168 @@ class Repository:
         rows = self.conn.execute(" ".join(parts), params).fetchall()
         return _rows_to_dicts(rows)
 
-    # ── Dashboard ───────────────────────────────────────────
+    # ── Agent Runs ──────────────────────────────────────────
 
+    def create_agent_run(
+        self,
+        run_id: str,
+        member_id: int | None,
+        user_input: str,
+        tool_calls_json: str = "[]",
+        status: str = "completed",
+        duration_ms: int = 0,
+        model_used: str = "",
+        result_summary: str = "",
+    ) -> dict[str, Any]:
+        cursor = self.conn.execute(
+            """INSERT INTO agent_runs
+               (run_id, member_id, user_input, tool_calls_json, status,
+                duration_ms, model_used, result_summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                member_id,
+                user_input,
+                tool_calls_json,
+                status,
+                duration_ms,
+                model_used,
+                result_summary,
+            ),
+        )
+        self.conn.commit()
+        return self.get_agent_run(run_id)
+
+    def get_agent_run(self, run_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM agent_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+    def list_agent_runs(
+        self, limit: int = 50, member_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        parts = ["SELECT * FROM agent_runs WHERE 1=1"]
+        params: list[Any] = []
+        if member_id is not None:
+            parts.append("AND member_id = ?")
+            params.append(member_id)
+        parts.append("ORDER BY created_at DESC LIMIT ?")
+        params.append(limit)
+        rows = self.conn.execute(" ".join(parts), params).fetchall()
+        return _rows_to_dicts(rows)
+
+    def create_agent_run_tool_call(
+        self,
+        run_id: str,
+        tool_name: str,
+        arguments_json: str = "{}",
+        result_summary: str = "",
+        duration_ms: int = 0,
+        call_order: int = 0,
+    ) -> dict[str, Any]:
+        cursor = self.conn.execute(
+            """INSERT INTO agent_run_tool_calls
+               (run_id, tool_name, arguments_json, result_summary, duration_ms, call_order)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (run_id, tool_name, arguments_json, result_summary, duration_ms, call_order),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT * FROM agent_run_tool_calls WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+    def list_agent_run_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM agent_run_tool_calls WHERE run_id = ? ORDER BY call_order ASC",
+            (run_id,),
+        ).fetchall()
+        return _rows_to_dicts(rows)
+
+    # ── Meeting Actions ─────────────────────────────────────
+
+    def create_meeting_action(
+        self,
+        action_text: str,
+        meeting_title: str = "",
+        responsible_person: str = "",
+        due_date: str = "",
+        status: str = "pending",
+        member_id: int | None = None,
+        reminder_id: int | None = None,
+        source_meeting_id: str = "",
+    ) -> dict[str, Any]:
+        cursor = self.conn.execute(
+            """INSERT INTO meeting_actions
+               (action_text, meeting_title, responsible_person, due_date,
+                status, member_id, reminder_id, source_meeting_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                action_text,
+                meeting_title,
+                responsible_person,
+                due_date,
+                status,
+                member_id,
+                reminder_id,
+                source_meeting_id,
+            ),
+        )
+        self.conn.commit()
+        return self.get_meeting_action(int(cursor.lastrowid))
+
+    def get_meeting_action(self, action_id: int) -> dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM meeting_actions WHERE id = ?",
+            (action_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+    def list_meeting_actions(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        parts = ["SELECT * FROM meeting_actions WHERE 1=1"]
+        params: list[Any] = []
+        if status:
+            parts.append("AND status = ?")
+            params.append(status)
+        parts.append("ORDER BY due_date ASC, created_at DESC LIMIT ?")
+        params.append(limit)
+        rows = self.conn.execute(" ".join(parts), params).fetchall()
+        return _rows_to_dicts(rows)
+
+    def update_meeting_action(self, action_id: int, **kwargs: Any) -> dict[str, Any]:
+        if not kwargs:
+            return self.get_meeting_action(action_id)
+        sets = []
+        params: list[Any] = []
+        for key, value in kwargs.items():
+            sets.append(f"{key} = ?")
+            params.append(value)
+        sets.append("updated_at = ?")
+        params.append(_now_str())
+        params.append(action_id)
+        self.conn.execute(
+            f"UPDATE meeting_actions SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        self.conn.commit()
+        return self.get_meeting_action(action_id)
+
+    def delete_meeting_action(self, action_id: int) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM meeting_actions WHERE id = ?",
+            (action_id,),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    # ── Dashboard ───────────────────────────────────────────
     def get_dashboard(self) -> dict[str, Any]:
         """Aggregate overview data for the web dashboard."""
         result: dict[str, Any] = {}
@@ -863,6 +1172,76 @@ class Repository:
             f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
         )
         self.conn.commit()
+
+    # ── Chat Memory ─────────────────────────────────────────
+
+    def get_chat_session(self, session_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def create_chat_session(self, session_id: str, title: str = "", member_id: int | None = None) -> dict[str, Any]:
+        self.conn.execute(
+            """INSERT INTO chat_sessions (id, title, member_id)
+               VALUES (?, ?, ?)""",
+            (session_id, title, member_id),
+        )
+        self.conn.commit()
+        return self.get_chat_session(session_id) or {}
+
+    def update_chat_session(self, session_id: str, title: str | None = None, message_count: int | None = None) -> None:
+        sets = []
+        params = []
+        if title is not None:
+            sets.append("title = ?")
+            params.append(title)
+        if message_count is not None:
+            sets.append("message_count = ?")
+            params.append(message_count)
+        if not sets:
+            return
+        sets.append("updated_at = ?")
+        params.append(_now_str())
+        params.append(session_id)
+        self.conn.execute(
+            f"UPDATE chat_sessions SET {', '.join(sets)} WHERE id = ?", params
+        )
+        self.conn.commit()
+
+    def list_chat_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM chat_sessions ORDER BY updated_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return _rows_to_dicts(rows)
+
+    def delete_chat_session(self, session_id: str) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+            self.conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+
+    def add_chat_message(self, session_id: str, role: str, content: str, tool_calls_json: str = "") -> dict[str, Any]:
+        cursor = self.conn.execute(
+            """INSERT INTO chat_messages (session_id, role, content, tool_calls_json)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, role, content, tool_calls_json),
+        )
+        msg_id = cursor.lastrowid
+        self.conn.execute(
+            "UPDATE chat_sessions SET message_count = message_count + 1, updated_at = ? WHERE id = ?",
+            (_now_str(), session_id)
+        )
+        self.conn.commit()
+        row = self.conn.execute("SELECT * FROM chat_messages WHERE id = ?", (msg_id,)).fetchone()
+        return _row_to_dict(row)
+
+    def get_chat_messages(self, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, limit)
+        ).fetchall()
+        return _rows_to_dicts(list(reversed(rows)))
 
     def close(self) -> None:
         self.conn.close()

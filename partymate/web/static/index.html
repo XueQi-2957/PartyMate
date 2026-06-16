@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.5">
 <title>PartyMate · 党务智能助手</title>
-<link rel="stylesheet" href="style.css">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css?v=5">
 </head>
 <body>
 
@@ -53,6 +54,14 @@
       <button class="nav-btn" data-tab="kanban" onclick="switchTab('kanban')">
         <span class="nav-icon">📊</span>
         <span class="nav-label">发展看板</span>
+      </button>
+      <button class="nav-btn" data-tab="trace" onclick="switchTab('trace')">
+        <span class="nav-icon">🔄</span>
+        <span class="nav-label">执行记录</span>
+      </button>
+      <button class="nav-btn" data-tab="settings" onclick="switchTab('settings')">
+        <span class="nav-icon">⚙️</span>
+        <span class="nav-label">设置</span>
       </button>
       <div class="nav-footer">
         <div class="nav-version" id="versionDisplay">v1.3.0</div>
@@ -248,6 +257,7 @@
             <div class="result-actions">
               <button class="btn btn-sm" onclick="copyResult('meetingResult')">📋 复制</button>
               <button class="btn btn-sm btn-gold" id="meetingDownloadBtn" style="display:none" onclick="downloadFile(this.dataset.path)">📝 下载 Word</button>
+              <button class="btn btn-sm btn-secondary" id="meetingParseActionsBtn" style="display:none" onclick="parseMeetingActions()">📌 解析待办并写入提醒</button>
             </div>
           </div>
           <pre class="result-body" id="meetingBody"></pre>
@@ -294,35 +304,46 @@
       <section class="tab-pane" id="pane-chat">
         <div class="pane-header">
           <h2>💬 AI 对话</h2>
-          <p class="pane-desc">用自然语言与 PartyMate AI 交流，支持上传文件解析后发送</p>
+          <p class="pane-desc">用自然语言与 PartyMate AI 交流，支持多轮记忆和流式思考</p>
         </div>
-        <div class="card chat-card">
-          <div class="chat-messages" id="chatMessages">
-            <div class="msg msg-ai">
-              <div class="msg-avatar">🤖</div>
-              <div class="msg-bubble">
-                <strong>你好！我是 PartyMate 党务智能助手</strong><br><br>
-                📎 支持上传文件：点击下方 📂 按钮上传 PDF/Word/图片<br>
-                📋 让我检查一份党员材料<br>
-                📝 整理会议记录<br>
-                📚 生成党课内容
-              </div>
+        <div class="card chat-layout">
+          <div class="chat-sidebar">
+            <button class="btn btn-sm btn-gold" onclick="prepareNewSession()" style="width:100%;margin-bottom:12px;border-radius:8px;padding:8px 0;">＋ 新对话</button>
+            <div class="chat-sessions-list" id="chatSessionsList">
+              <!-- 会话列表渲染 -->
             </div>
           </div>
-          <!-- 文件上传条（嵌入聊天） -->
-          <div class="chat-upload-row">
-            <button class="chat-upload-btn" onclick="document.getElementById('chatFileInput').click()">📂 上传文件解析</button>
-            <span id="chatFileLabel"></span>
-            <input type="file" id="chatFileInput" accept=".pdf,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tiff"
-                   style="display:none" onchange="handleChatFileSelect(event)">
+          <div class="chat-main" id="chatMainPanel">
+            <div class="chat-messages" id="chatMessages">
+              <div class="msg msg-ai">
+                <div class="msg-avatar">🤖</div>
+                <div class="msg-bubble">
+                  <strong>你好！我是 PartyMate 党务智能助手</strong><br><br>
+                  📎 支持上传文件：点击下方 📂 按钮上传 PDF/Word/图片<br>
+                  📋 让我检查一份党员材料<br>
+                  📝 整理会议记录<br>
+                  📚 生成党课内容
+                </div>
+              </div>
+            </div>
+            <div class="chat-context-bar" id="chatMemberContextBar">
+              当前未绑定成员上下文，AI 对话为通用模式
+            </div>
+            <!-- 文件上传条（嵌入聊天） -->
+            <div class="chat-upload-row">
+              <button class="chat-upload-btn" onclick="document.getElementById('chatFileInput').click()">📂 上传文件解析</button>
+              <span id="chatFileLabel"></span>
+              <input type="file" id="chatFileInput" accept=".pdf,.docx,.doc,.png,.jpg,.jpeg,.bmp,.tiff"
+                     style="display:none" onchange="handleChatFileSelect(event)">
+            </div>
+            <div class="chat-input-row">
+              <input class="chat-input" id="chatInput" type="text"
+                placeholder="输入你的问题，或上传文件后询问..."
+                onkeydown="if(event.key==='Enter') sendChat()">
+              <button class="btn btn-primary chat-send" onclick="sendChat()" id="chatSendBtn">发送</button>
+            </div>
+            <div class="chat-status" id="chatStatus"></div>
           </div>
-          <div class="chat-input-row">
-            <input class="chat-input" id="chatInput" type="text"
-              placeholder="输入你的问题，或上传文件后询问..."
-              onkeydown="if(event.key==='Enter') sendChat()">
-            <button class="btn btn-primary chat-send" onclick="sendChat()">发送</button>
-          </div>
-          <div class="chat-status" id="chatStatus"></div>
         </div>
       </section>
 
@@ -385,7 +406,109 @@
         </div>
       </section>
 
+      <!-- ========== 🔄 Agent 执行记录 ========== -->
+      <section class="tab-pane" id="pane-trace">
+        <div class="pane-header">
+          <h2>🔄 Agent 执行记录</h2>
+          <p class="pane-desc">AI 对话的工具调用历史与执行追踪，可查看每次请求的工具调用和耗时</p>
+        </div>
+        <div class="card">
+          <div class="card-body" style="padding:14px">
+            <div class="field-actions" style="margin-bottom:12px">
+              <button class="btn btn-primary" onclick="loadAgentRuns()">🔄 刷新</button>
+            </div>
+            <div id="agentRunsList">
+              <div class="loading" style="padding:20px;text-align:center">加载执行记录...</div>
+            </div>
+          </div>
+        </div>
+        <!-- Run detail panel (hidden by default) -->
+        <div class="result-card" id="agentRunDetail" style="display:none">
+          <div class="result-header">
+            <h3 id="agentRunDetailTitle">执行详情</h3>
+            <button class="btn btn-sm" onclick="closeAgentRunDetail()">关闭</button>
+          </div>
+          <pre class="result-body" id="agentRunDetailBody"></pre>
+        </div>
+      </section>
+
+      <!-- ========== ⚙️ 设置 ========== -->
+      <section class="tab-pane" id="pane-settings">
+        <div class="pane-header">
+          <h2>⚙️ 设置</h2>
+          <p class="pane-desc">AI 模型连接配置。保存后需重启服务生效。</p>
+        </div>
+        <div class="split-layout">
+          <!-- 左侧：表单 -->
+          <div class="split-panel">
+            <div class="settings-card" style="margin:0">
+              <div class="form-group">
+                <label for="setApiBase">🔗 API 地址</label>
+                <input type="text" id="setApiBase" class="form-input"
+                       placeholder="http://127.0.0.1:11434/v1"
+                       title="兼容 OpenAI 格式的 API 地址">
+                <p class="form-hint">默认: http://127.0.0.1:11434/v1（本地 Ollama）</p>
+              </div>
+              <div class="form-group">
+                <label for="setApiKey">🔑 API Key</label>
+                <input type="password" id="setApiKey" class="form-input"
+                       placeholder="留空则使用本地 Ollama（无需 Key）">
+                <p class="form-hint">外部 API（如 DeepSeek）需要填入 Key</p>
+              </div>
+              <div class="form-group">
+                <label for="setModel">🤖 模型名称</label>
+                <div style="display:flex;gap:8px;align-items:start">
+                  <input type="text" id="setModel" class="form-input" style="flex:1"
+                         placeholder="qwen3.5:4b">
+                  <button class="btn btn-sm" id="btnScanModels" onclick="scanOllamaModels()"
+                          title="扫描本机 Ollama 已安装的模型">📡 扫描</button>
+                </div>
+                <p class="form-hint">默认: qwen3.5:4b</p>
+                <div id="localModelsList" style="margin-top:8px;display:none"></div>
+              </div>
+              <div class="form-actions">
+                <button class="btn btn-primary" onclick="saveSettings()">💾 保存</button>
+                <button class="btn btn-sm" onclick="resetSettingsForm()">↺ 默认</button>
+                <span id="settingsStatus" class="settings-status"></span>
+              </div>
+            </div>
+          </div>
+          <!-- 右侧：状态 + 提示 -->
+          <div class="split-panel">
+            <div class="settings-card" style="margin:0">
+              <h4 style="margin:0 0 14px;font-size:14px">📋 当前配置</h4>
+              <table class="settings-table">
+                <tr><td>状态</td><td id="settingsStatusInfo">⏳ 加载中...</td></tr>
+                <tr><td>API 地址</td><td id="settingsSummaryBase" style="font-family:monospace">-</td></tr>
+                <tr><td>模型</td><td id="settingsSummaryModel" style="font-family:monospace">-</td></tr>
+              </table>
+              <div class="settings-tips">
+                <h4>💡 常用模型</h4>
+                <table class="settings-table">
+                  <tr><th>场景</th><th>API 地址</th><th>模型</th></tr>
+                  <tr><td>🚀 Ollama</td><td><code>http://127.0.0.1:11434/v1</code></td><td><code>qwen3.5:4b</code></td></tr>
+                  <tr><td>🪐 DeepSeek</td><td><code>https://api.deepseek.com/v1</code></td><td><code>deepseek-chat</code></td></tr>
+                  <tr><td>☁️ OpenAI</td><td><code>https://api.openai.com/v1</code></td><td><code>gpt-4o-mini</code></td></tr>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
     </main>
+
+    <!-- ===== 右侧信息面板 ===== -->
+    <aside class="right-panel" id="rightPanel">
+      <div id="rightPanelContent">
+        <!-- 右侧内容由 JS 动态渲染 -->
+        <div class="rp-card">
+          <div class="rp-header">📡 系统状态</div>
+          <div class="rp-body" id="rightPanelBody">
+            <div style="color:var(--text-dim);padding:8px;text-align:center;font-size:12px">加载中...</div>
+          </div>
+        </div>
+      </div>
+    </aside>
   </div>
 </div>
 
@@ -411,7 +534,7 @@
       <textarea class="field-textarea" id="newMemberNotes" rows="3" placeholder="可选备注信息"></textarea>
     </div>
     <div class="modal-footer">
-      <button class="btn" onclick="hideAddMemberModal()">取消</button>
+      <button class="btn btn-sm" onclick="hideAddMemberModal()">取消</button>
       <button class="btn btn-primary" onclick="addMember()">确认添加</button>
     </div>
   </div>
@@ -419,6 +542,7 @@
 
 <input type="file" id="memberArchiveInput" accept=".zip" style="display:none" onchange="handleMemberArchiveSelected(event)">
 
-<script src="app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="app.js?v=8"></script>
 </body>
 </html>

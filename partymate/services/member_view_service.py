@@ -4,17 +4,20 @@ import json
 from typing import Any
 
 from partymate.db.repository import Repository
+from partymate.services.member_memory_service import MemberMemoryService
 
 
 class MemberViewService:
     def __init__(self, repo: Repository) -> None:
         self.repo = repo
+        self.memories = MemberMemoryService(repo)
 
     def build_member_detail(self, member_id: int) -> dict[str, Any]:
         member = self.repo.get_member(member_id)
         if not member:
             return {}
         pending_ocr_tasks = self._build_pending_ocr_tasks(member_id)
+        memories = self.memories.list_memories(member_id, include_merged=False, limit=20)
 
         return {
             **member,
@@ -42,6 +45,9 @@ class MemberViewService:
             ),
             "pending_ocr_tasks": pending_ocr_tasks,
             "pending_ocr_task_count": len(pending_ocr_tasks),
+            "memories": memories,
+            "memory_count": len(memories),
+            "pinned_memory_count": sum(1 for item in memories if item.get("pinned")),
         }
 
     def build_dashboard(self) -> dict[str, Any]:
