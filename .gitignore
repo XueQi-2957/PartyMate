@@ -18,7 +18,12 @@ wheels/
 data/
 output/
 
-# Knowledge base (Chinese name directory)
+# Knowledge base (auto-generated data)
+partymate/knowledge/chroma_db/
+partymate/knowledge/chunks_index.json
+partymate/knowledge/parents_index.json
+
+# Knowledge base (Chinese name directory, if any)
 知识库/
 
 # OS files

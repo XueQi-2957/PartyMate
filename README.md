@@ -27,6 +27,7 @@
 | 🧠 **Agent 执行追踪（Trace）** | 每次 AI 对话自动记录：用户输入、模型选择、工具调用链、耗时、结果摘要 | **Agent 可观测性设计** |
 | 🔄 **会议闭环工作流** | 从「整理纪要到自动提取待办事项并写入提醒系统」，形成任务闭环 | **工作流编排能力** |
 | 📦 **ZIP 材料包导入 + 一致性核查** | 上传成员材料包，自动解压、识别材料类型、整套一致性检查（缺件/重复/阶段冲突/身份冲突） | **多步骤 Agent 任务编排** |
+| 🔍 **表格结构化分块** | 69 个党务模板表转为 key:value 自然语言索引，小表整表一块、大表双阈值自适应切分，metadata 携带 build_at/table_num/section/row_range | **RAG 表格处理能力** |
 | 🧠 **成员级独立记忆** | 每个成员独立的记忆命名空间，Agent 只加载当前成员的事实与历史结论 | **Agent 长期记忆设计** |
 | 🔍 **OCR 人工复核闭环** | 低置信度 OCR 片段标记 → 人工修正 → 确认入库，形成人机协同流程 | **人机协同设计模式** |
 | 🎯 **痛点导向** | 基于真实党务工作体验，非「造轮子」项目 | **产品设计思维** |
@@ -117,11 +118,23 @@ partymate content "党纪学习教育"
 
 **核心亮点：** 每个成员独立的记忆命名空间，Agent 只加载当前成员的事实与历史结论，避免跨成员上下文串扰。
 
-- 支持类型：结论摘要 / 风险提醒 / 工作指令 / 修订结论 / 一般记录
-- 支持置顶、合并、删除
+- 支持类型：summary / risk / instruction / correction / note
+- 支持重要性（LOW=1 / MEDIUM=2 / HIGH=3）和置顶标记
+- 支持合并、删除
 - Agent 对话时可绑定某成员，自动注入记忆作为上下文
+- Agent 上下文排序：置顶优先 → 最新更新优先（LIMIT 8）
 
-### 5. 🔍 OCR 人工复核闭环
+### 5. 📑 RAG 知识库（表格智能分块）
+
+**核心亮点：** 官方规程 DOCX 的表格不再与文本混堆，通过 python-docx oxml 按文档顺序交错提取，表格单独走结构化索引。
+
+- 段落经 LLM 语义分块 → **61 个文本知识块**
+- 69 个表格经结构化分块 → **80 个表格知识块**（key:value 序列化 + 摘要 + 元数据）
+- 小表格（≤20 行且 ≤2500 字）整表 1 chunk，大表格自适应切分
+- 每 chunk 携带 build_at / chunk_type / table_num / section / row_range 等元数据
+- 检索时三阶段递进：bge-m3 稠密向量 + BM25 稀疏融合初选 TOP 15 → Cross-Encoder 精排取 TOP 5 → 注入 Agent 上下文取 TOP 3
+
+### 6. 🔍 OCR 人工复核闭环
 
 **核心亮点：** 人机协同设计，体现「机器初稿 + 人工确认 + 正式入库」的工程思维。
 
@@ -133,13 +146,13 @@ partymate content "党纪学习教育"
         人工修正确认 → 正式文本入库
 ```
 
-### 6. 🗺️ 发展看板与提醒
+### 7. 🗺️ 发展看板与提醒
 
 - 按发展阶段的成员分组（申请人/积极分子/发展对象/预备党员/正式党员）
 - 材料进度条、时间线、待提交/已提交标记
 - 待办提醒：材料缺件、阶段超期
 
-### 7. 🔄 Agent 执行记录（Trace）Tab
+### 8. 🔄 Agent 执行记录（Trace）Tab
 
 **核心亮点：** 每次 AI 对话自动记录可追溯的执行轨迹，体现 Agent 可观测性设计。
 
@@ -160,7 +173,7 @@ partymate content "党纪学习教育"
 | **Agent 框架** | 手写 runtime（httpx + function calling） | AI 工具调用与执行追踪 |
 | **LLM** | Ollama（本地）/ 任意 OpenAI-compatible API | AI 增强模式 |
 | **数据库** | SQLite（5 个主表 + 3 个扩展表） | 结构化持久化 |
-| **文件解析** | PyMuPDF / python-docx / easyocr | PDF/Word/图片解析 |
+| **文件解析** | PyMuPDF / python-docx / easyocr / python-docx oxml | PDF/Word/图片解析 + 表格智能分块 |
 | **导出** | python-pptx / python-docx | PPT / Word 导出 |
 | **Web 服务** | Starlette + Uvicorn | REST API |
 | **前端** | 原生 HTML/CSS/JS（红金党务主题 SPA） | 工作台 UI |
@@ -236,7 +249,7 @@ E:\Hermes\PartyMate\
 │   │   ├── meeting_summary.py  # 会议记录整理
 │   │   ├── content_gen.py      # 三会一课内容生成
 │   │   ├── file_parser.py      # 文件解析（PDF/Word/OCR）
-│   │   └── rag.py              # 规则知识库检索
+│   │   └── rag.py              # RAG 混合检索引擎（bge-m3+BM25+CE 三阶段，含表格智能分块）
 │   │
 │   ├── knowledge/
 │   │   └── party_rules.md      # 党务规则知识库

@@ -1,22 +1,12 @@
 """
-PartyMate 混合检索 RAG 引擎
-============================
-基于 Ollama bge-m3（稠密向量）+ BM25（稀疏关键词）+ LLM Rerank 的三阶段混合检索。
+PartyMate hybrid RAG engine.
 
-特性:
-  - Ollama bge-m3 做向量嵌入（GPU 加速，支持中文/多语言 8192 tokens）
-  - rank-bm25 做稀疏检索，弥补纯语义检索的关键词精度
-  - LLM Rerank 对初检结果做二次精排
-  - LLM 驱动的语义分块（大文档自动拆分重叠窗口分批处理）
-  - 知识库自动构建（DOCX → 清洗 → 分块 → 索引）
-  - 针对《贵州省发展党员工作规程（试行）》25步流程做了专项检索优化
-  - 纯开源免费方案（Ollama + ChromaDB + BM25），无需 GPU 训练，无需 API Key
-
-用法:
-    from partymate.tools.rag import VectorRAG
-    rag = VectorRAG()
-    results = rag.search("入党申请书需要什么条件")
-    print(rag.format_citations(results))
+The index is built as parent/child retrieval:
+  - parent chunks keep document, chapter, table, and template context.
+  - child chunks are the searchable evidence units stored in ChromaDB and BM25.
+  - Ollama bge-m3 creates dense vectors.
+  - Ollama minicpm-v-fast may mark semantic boundaries, but original text is
+    always sliced from source lines so the model cannot rewrite evidence.
 """
 
 from __future__ import annotations
@@ -24,9 +14,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -34,65 +27,678 @@ import chromadb
 import httpx
 from rank_bm25 import BM25Okapi
 
-# ── 路径 ──────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────
 
 HERE = Path(__file__).resolve().parent.parent
-KNOWLEDGE_DIR = HERE / "knowledge"
-CHROMA_DIR = KNOWLEDGE_DIR / "chroma_db"
-CHUNK_INDEX_FILE = KNOWLEDGE_DIR / "chunks_index.json"
+RUNTIME_KNOWLEDGE_DIR = HERE / "knowledge"
+SOURCE_KNOWLEDGE_DIR = HERE.parent / "知识库"
+CHROMA_DIR = RUNTIME_KNOWLEDGE_DIR / "chroma_db"
+CHUNK_INDEX_FILE = RUNTIME_KNOWLEDGE_DIR / "chunks_index.json"
+PARENT_INDEX_FILE = RUNTIME_KNOWLEDGE_DIR / "parents_index.json"
 
-# ── LLM 配置（复用 agent.py 的配置） ──────────────────
+# ── Ollama / OpenAI-compatible config ─────────────────
 
 API_BASE = os.getenv("PARTYMATE_API_BASE") or os.getenv("OPENAI_BASE_URL") or "http://127.0.0.1:11434/v1"
 API_KEY = os.getenv("PARTYMATE_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-MODEL = os.getenv("PARTYMATE_MODEL") or os.getenv("HERMES_MODEL") or "qwen3.5:4b"
+# Runtime answer/rerank model remains user-configurable. Semantic chunking has
+# its own fast local default below.
+MODEL = os.getenv("PARTYMATE_MODEL") or os.getenv("HERMES_MODEL") or "gemma4:e4b"
+CHUNK_MODEL = os.getenv("PARTYMATE_CHUNK_MODEL") or "minicpm-v-fast:latest"
+VISION_MODEL = os.getenv("PARTYMATE_VISION_MODEL") or "gemma4:e4b"
+USE_LLM_CHUNKING = os.getenv("PARTYMATE_USE_LLM_CHUNKING", "0").lower() in {"1", "true", "yes"}
 
-# ── 检索参数 ──────────────────────────────────────────
+OLLAMA_BASE = os.getenv("OLLAMA_HOST") or "http://127.0.0.1:11434"
+EMBED_MODEL = os.getenv("PARTYMATE_EMBED_MODEL") or "bge-m3:latest"
+
+# ── Retrieval parameters ──────────────────────────────
 
 DEFAULT_TOP_K = 5
-HYBRID_ALPHA = 0.6      # 稠密检索权重 (0.6) vs 稀疏检索权重 (0.4)
-HYBRID_TOP_K = 15       # 混合检索初选候选数（rerank 前）
-DEFAULT_RERANK = True   # 默认启用重排
-RERANK_MODE = "cross-encoder"  # "cross-encoder" | "llm" | "none"
-RERANK_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-CHUNK_MIN_CHARS = 150   # chunk 最少字数
-CHUNK_MAX_CHARS = 1500  # chunk 最大字数
-REINDEX_THRESHOLD = 0.3  # 知识库变化超过 30% 时自动重建
+HYBRID_ALPHA = 0.6
+HYBRID_TOP_K = 15
+DEFAULT_RERANK = True
+RERANK_MODE = os.getenv("PARTYMATE_RERANK_MODE") or "cross-encoder"
+RERANK_MODEL_NAME = os.getenv("PARTYMATE_RERANK_MODEL") or "BAAI/bge-reranker-v2-m3"
+FUSION_MODE = os.getenv("PARTYMATE_FUSION_MODE") or "rrf"  # "linear" 或 "rrf"
+RRF_K = 60  # RRF 常数
 
-# ── 嵌入模型（Ollama bge-m3，GPU 加速） ─────────────
+PARENT_TARGET_CHARS = 2200
+PARENT_MAX_CHARS = 3200
+CHILD_MIN_CHARS = 12
+CHILD_TARGET_CHARS = 450
+CHILD_MAX_CHARS = 700
+TABLE_CHILD_CHARS = 1400
 
-EMBED_MODEL = "bge-m3"
-OLLAMA_BASE = os.getenv("OLLAMA_HOST") or "http://127.0.0.1:11434"
+SUPPORTED_EXTS = {".docx", ".pdf", ".txt"}
+SKIPPED_EXTS = {".doc"}
+
+
+@dataclass
+class DocumentElement:
+    doc_name: str
+    source_path: str
+    page_no: int | None
+    heading_path: str
+    element_type: str
+    text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ParentChunk:
+    parent_id: str
+    doc_name: str
+    source_path: str
+    title: str
+    heading_path: str
+    content: str
+    chunk_type: str = "text"
+    page_no: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ParentChunk":
+        return cls(**data)
+
+
+@dataclass
+class ChildChunk:
+    child_id: str
+    parent_id: str
+    doc_name: str
+    source_path: str
+    title: str
+    heading_path: str
+    content: str
+    chunk_type: str = "text"
+    page_no: int | None = None
+    article_no: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def citation(self) -> str:
+        parts = []
+        if self.doc_name:
+            parts.append(self.doc_name)
+        if self.heading_path and not self.heading_path.startswith(self.doc_name):
+            parts.append(self.heading_path)
+        elif self.heading_path:
+            parts = [self.heading_path]
+        if self.article_no and self.article_no not in self.heading_path:
+            parts.append(self.article_no)
+        if self.page_no:
+            parts.append(f"第{self.page_no}页")
+        return " > ".join([p for p in parts if p])
+
+    @property
+    def embedding_text(self) -> str:
+        prefix = self.citation
+        if self.chunk_type == "table":
+            prefix = f"{prefix} > 表格"
+        return f"{prefix}\n{self.content}".strip()
+
+    def to_metadata(self, idx: int, build_at: str) -> dict[str, str]:
+        meta = {
+            "title": self.title,
+            "idx": str(idx),
+            "build_at": build_at,
+            "parent_id": self.parent_id,
+            "doc_name": self.doc_name,
+            "source_path": self.source_path,
+            "heading_path": self.heading_path,
+            "article_no": self.article_no,
+            "chunk_type": self.chunk_type,
+            "citation": self.citation,
+            "page_no": str(self.page_no or ""),
+        }
+        for key, value in self.metadata.items():
+            if isinstance(value, (dict, list)):
+                meta[key] = json.dumps(value, ensure_ascii=False)
+            else:
+                meta[key] = "" if value is None else str(value)
+        return meta
+
+
+def _clean_text(text: str) -> str:
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return "\n".join(line.strip() for line in text.splitlines()).strip()
+
+
+def _safe_id(prefix: str = "") -> str:
+    raw = uuid.uuid4().hex[:12]
+    return f"{prefix}{raw}" if prefix else raw
+
+
+def _looks_like_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 80:
+        return False
+    patterns = [
+        r"^第[一二三四五六七八九十百\d]+[章节条阶段]\s*",
+        r"^[一二三四五六七八九十\d]+[、．.]\s*",
+        r"^（[一二三四五六七八九十\d]+）",
+        r".*(条例|细则|规程|办法|规定|标准|手册|说明|清单)$",
+    ]
+    return any(re.match(pattern, stripped) for pattern in patterns)
+
+
+def _article_no(text: str) -> str:
+    match = re.match(r"^\s*(第[一二三四五六七八九十百零〇两\d]+条)", text)
+    if match:
+        return match.group(1)
+    step_match = re.match(r"^\s*(第[一二三四五六七八九十百零〇两\d]+步)", text)
+    if step_match:
+        return step_match.group(1)
+    return ""
+
+
+def _discover_knowledge_files(path: str | Path | None = None) -> tuple[list[Path], list[Path]]:
+    root = Path(path) if path is not None else SOURCE_KNOWLEDGE_DIR
+    if root.is_file():
+        files = [root]
+    elif root.exists():
+        files = sorted(p for p in root.iterdir() if p.is_file())
+    else:
+        return [], []
+    supported = [p for p in files if p.suffix.lower() in SUPPORTED_EXTS]
+    skipped = [p for p in files if p.suffix.lower() in SKIPPED_EXTS]
+    return supported, skipped
+
+
+def _load_txt_elements(path: str | Path) -> list[DocumentElement]:
+    source = Path(path)
+    text = source.read_text(encoding="utf-8", errors="ignore")
+    lines = [_clean_text(line) for line in text.splitlines()]
+    elements: list[DocumentElement] = []
+    heading_parts: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if _looks_like_heading(line):
+            if not heading_parts:
+                heading_parts = [line]
+            elif re.match(r"^第[一二三四五六七八九十百\d]+[章节阶段]", line):
+                heading_parts = [heading_parts[0], line]
+            elif len(heading_parts) < 3:
+                heading_parts.append(line)
+            else:
+                heading_parts[-1] = line
+            element_type = "heading"
+        else:
+            element_type = "text"
+        elements.append(
+            DocumentElement(
+                doc_name=source.stem,
+                source_path=str(source),
+                page_no=None,
+                heading_path=" > ".join(heading_parts) if heading_parts else source.stem,
+                element_type=element_type,
+                text=line,
+            )
+        )
+    return elements
+
+
+def _iter_docx_body(doc: Any) -> list[tuple[str, Any]]:
+    from docx.oxml.ns import qn
+
+    body = doc.element.body
+    out: list[tuple[str, Any]] = []
+    para_idx = 0
+    table_idx = 0
+    for child in body:
+        if child.tag == qn("w:p"):
+            out.append(("paragraph", doc.paragraphs[para_idx]))
+            para_idx += 1
+        elif child.tag == qn("w:tbl"):
+            out.append(("table", doc.tables[table_idx]))
+            table_idx += 1
+    return out
+
+
+def _dedupe_row(row: list[str]) -> list[str]:
+    result: list[str] = []
+    last = object()
+    for cell in row:
+        if cell != last:
+            result.append(cell)
+        last = cell
+    return result
+
+
+def _load_docx_elements(path: str | Path) -> list[DocumentElement]:
+    from docx import Document
+
+    source = Path(path)
+    doc = Document(str(source))
+    elements: list[DocumentElement] = []
+    heading_parts: list[str] = []
+    table_num = 0
+
+    for kind, obj in _iter_docx_body(doc):
+        if kind == "paragraph":
+            text = _clean_text(obj.text)
+            if not text:
+                continue
+            style_name = obj.style.name if obj.style else ""
+            is_heading = "heading" in style_name.lower() or _looks_like_heading(text)
+            if is_heading:
+                if not heading_parts:
+                    heading_parts = [text]
+                elif re.match(r"^第[一二三四五六七八九十百\d]+[章节阶段]", text):
+                    heading_parts = [heading_parts[0], text]
+                elif len(heading_parts) < 3:
+                    heading_parts.append(text)
+                else:
+                    heading_parts[-1] = text
+            elements.append(
+                DocumentElement(
+                    doc_name=source.stem,
+                    source_path=str(source),
+                    page_no=None,
+                    heading_path=" > ".join(heading_parts) if heading_parts else source.stem,
+                    element_type="heading" if is_heading else "text",
+                    text=text,
+                )
+            )
+            continue
+
+        table_num += 1
+        rows = []
+        for row in obj.rows:
+            cells = [_clean_text(cell.text) for cell in row.cells]
+            rows.append(_dedupe_row(cells))
+        if not rows:
+            continue
+        headers = rows[0]
+        body_rows = rows[1:] if len(rows) > 1 else []
+        table_title = heading_parts[-1] if heading_parts else f"表格{table_num}"
+        text = _serialize_table_rows(table_title, headers, body_rows)
+        elements.append(
+            DocumentElement(
+                doc_name=source.stem,
+                source_path=str(source),
+                page_no=None,
+                heading_path=" > ".join(heading_parts) if heading_parts else source.stem,
+                element_type="table",
+                text=text,
+                metadata={
+                    "table_num": table_num,
+                    "headers": headers,
+                    "rows": body_rows,
+                    "num_rows": len(body_rows),
+                    "num_cols": len(headers),
+                },
+            )
+        )
+    return elements
+
+
+def _load_pdf_elements(path: str | Path) -> list[DocumentElement]:
+    import fitz
+
+    source = Path(path)
+    elements: list[DocumentElement] = []
+    with fitz.open(str(source)) as doc:
+        for page_index, page in enumerate(doc, start=1):
+            text = _clean_text(page.get_text("text"))
+            if not text:
+                continue
+            elements.append(
+                DocumentElement(
+                    doc_name=source.stem,
+                    source_path=str(source),
+                    page_no=page_index,
+                    heading_path=f"{source.stem} > 第{page_index}页",
+                    element_type="text",
+                    text=text,
+                )
+            )
+    return elements
+
+
+def _serialize_table_rows(title: str, headers: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return f"表格：{title}\n字段：" + "、".join(h for h in headers if h)
+
+    lines = [f"表格：{title}", "字段：" + "、".join(h for h in headers if h)]
+    for row_idx, row in enumerate(rows, 1):
+        pairs: list[str] = []
+        for col_idx, cell in enumerate(row):
+            if not cell:
+                continue
+            header = headers[col_idx] if col_idx < len(headers) and headers[col_idx] else f"字段{col_idx + 1}"
+            pairs.append(f"{header}: {cell}")
+        if pairs:
+            lines.append(f"第{row_idx}行: " + "；".join(pairs))
+    return "\n".join(lines)
+
+
+def _load_document_elements(path: str | Path) -> list[DocumentElement]:
+    source = Path(path)
+    suffix = source.suffix.lower()
+    if suffix == ".docx":
+        return _load_docx_elements(source)
+    if suffix == ".pdf":
+        return _load_pdf_elements(source)
+    if suffix == ".txt":
+        return _load_txt_elements(source)
+    return []
+
+
+def _elements_to_parents(elements: list[DocumentElement]) -> list[ParentChunk]:
+    parents: list[ParentChunk] = []
+    buffer: list[DocumentElement] = []
+    current_key = ""
+
+    def flush() -> None:
+        nonlocal buffer
+        if not buffer:
+            return
+        first = buffer[0]
+        content = _clean_text("\n".join(e.text for e in buffer if e.text))
+        if not content:
+            buffer = []
+            return
+        title = first.heading_path or first.doc_name
+        chunk_type = "table" if all(e.element_type == "table" for e in buffer) else "text"
+        metadata: dict[str, Any] = {}
+        if chunk_type == "table":
+            metadata = dict(first.metadata)
+        parents.append(
+            ParentChunk(
+                parent_id=_safe_id("p_"),
+                doc_name=first.doc_name,
+                source_path=first.source_path,
+                title=title,
+                heading_path=first.heading_path or first.doc_name,
+                content=content,
+                chunk_type=chunk_type,
+                page_no=first.page_no,
+                metadata=metadata,
+            )
+        )
+        buffer = []
+
+    for element in elements:
+        key = f"{element.source_path}|{element.heading_path}|{element.page_no}|{element.element_type}"
+        should_flush = False
+        if not buffer:
+            current_key = key
+        elif element.element_type == "table" or buffer[-1].element_type == "table":
+            should_flush = True
+        elif key != current_key and sum(len(e.text) for e in buffer) >= CHILD_MIN_CHARS:
+            should_flush = True
+        elif sum(len(e.text) for e in buffer) + len(element.text) > PARENT_MAX_CHARS:
+            should_flush = True
+
+        if should_flush:
+            flush()
+            current_key = key
+        buffer.append(element)
+
+    flush()
+    return parents
+
+
+def _line_numbered_text(lines: list[str]) -> str:
+    return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+
+
+def _extract_json_array(text: str) -> list[dict[str, Any]]:
+    if not text.strip():
+        return []
+    fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, flags=re.S)
+    raw = fenced.group(1) if fenced else text
+    if not raw.strip().startswith("["):
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start >= 0 and end > start:
+            raw = raw[start : end + 1]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+_BOUNDARY_SYSTEM_PROMPT = """你是党务规范文档的语义边界标注器。
+你只能返回 JSON 数组，不能改写、总结、补充原文。
+每个对象必须包含 title、start_line、end_line、chunk_type、article_no、reason。
+start_line 和 end_line 必须来自用户提供的行号，且包含完整句子或完整条款。
+正文 chunk 目标 300-500 个中文字符；很短但完整的条款可以单独成块。
+
+Few-shot:
+输入:
+1: 第一章 总则
+2: 第一条 发展党员工作应当贯彻党的基本理论。
+3: 第二条 党组织应当把政治标准放在首位。
+输出:
+[
+  {"title":"第一章 总则 > 第一条","start_line":2,"end_line":2,"chunk_type":"text","article_no":"第一条","reason":"完整条款"},
+  {"title":"第一章 总则 > 第二条","start_line":3,"end_line":3,"chunk_type":"text","article_no":"第二条","reason":"完整条款"}
+]
+"""
+
+
+def _call_llm(system: str, prompt: str, max_tokens: int = 2048, model: str | None = None) -> str:
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    body = {
+        "model": model or MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+    }
+    try:
+        with httpx.Client(timeout=90.0) as client:
+            resp = client.post(f"{API_BASE}/chat/completions", headers=headers, json=body)
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return ""
+    return ""
+
+
+def _llm_child_boundaries(parent: ParentChunk) -> list[dict[str, Any]]:
+    lines = [line for line in parent.content.splitlines() if line.strip()]
+    if len(lines) < 2 or len(parent.content) > 7000:
+        return []
+    prompt = (
+        f"文档标题路径：{parent.heading_path}\n"
+        f"块类型：{parent.chunk_type}\n"
+        "请按语义边界标注以下文本：\n\n"
+        f"{_line_numbered_text(lines)}"
+    )
+    result = _call_llm(_BOUNDARY_SYSTEM_PROMPT, prompt, model=CHUNK_MODEL)
+    boundaries = _extract_json_array(result)
+    valid: list[dict[str, Any]] = []
+    for item in boundaries:
+        try:
+            start = int(item["start_line"])
+            end = int(item["end_line"])
+        except Exception:
+            continue
+        if start < 1 or end < start or end > len(lines):
+            continue
+        valid.append(
+            {
+                "title": str(item.get("title") or parent.title),
+                "start_line": start,
+                "end_line": end,
+                "chunk_type": str(item.get("chunk_type") or parent.chunk_type),
+                "article_no": str(item.get("article_no") or ""),
+            }
+        )
+    return valid
+
+
+def _split_long_text(lines: list[str], max_chars: int = CHILD_MAX_CHARS) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start = 0
+    count = 0
+    for idx, line in enumerate(lines):
+        count += len(line)
+        is_boundary = bool(re.search(r"[。！？；]$", line.strip())) or len(line) < 80
+        if count >= max_chars and is_boundary:
+            spans.append((start, idx))
+            start = idx + 1
+            count = 0
+    if start < len(lines):
+        spans.append((start, len(lines) - 1))
+    return spans
+
+
+def _rule_child_boundaries(parent: ParentChunk) -> list[dict[str, Any]]:
+    lines = [line for line in parent.content.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    if parent.chunk_type == "table":
+        spans: list[tuple[int, int]] = []
+        start = 0
+        chars = 0
+        for idx, line in enumerate(lines):
+            chars += len(line)
+            if idx > 1 and line.startswith("第") and "行:" in line and chars > TABLE_CHILD_CHARS:
+                spans.append((start, idx - 1))
+                start = idx
+                chars = len(line)
+        spans.append((start, len(lines) - 1))
+        return [
+            {
+                "title": parent.title,
+                "start_line": s + 1,
+                "end_line": e + 1,
+                "chunk_type": "table",
+                "article_no": "",
+            }
+            for s, e in spans
+        ]
+
+    article_starts = [i for i, line in enumerate(lines) if _article_no(line)]
+    if article_starts:
+        spans = []
+        for pos, start in enumerate(article_starts):
+            end = article_starts[pos + 1] - 1 if pos + 1 < len(article_starts) else len(lines) - 1
+            spans.extend(_split_long_text(lines[start : end + 1], max_chars=CHILD_MAX_CHARS))
+            if spans and spans[-1][0] < start:
+                # The long-text splitter works on sliced indexes.
+                pass
+        normalized: list[dict[str, Any]] = []
+        for pos, start in enumerate(article_starts):
+            end = article_starts[pos + 1] - 1 if pos + 1 < len(article_starts) else len(lines) - 1
+            slice_spans = _split_long_text(lines[start : end + 1], max_chars=CHILD_MAX_CHARS)
+            for rel_s, rel_e in slice_spans:
+                abs_s = start + rel_s
+                abs_e = start + rel_e
+                article = _article_no(lines[start])
+                normalized.append(
+                    {
+                        "title": f"{parent.heading_path} > {article}" if article else parent.title,
+                        "start_line": abs_s + 1,
+                        "end_line": abs_e + 1,
+                        "chunk_type": "text",
+                        "article_no": article,
+                    }
+                )
+        return normalized
+
+    spans = _split_long_text(lines, max_chars=CHILD_TARGET_CHARS)
+    return [
+        {
+            "title": parent.title,
+            "start_line": s + 1,
+            "end_line": e + 1,
+            "chunk_type": parent.chunk_type,
+            "article_no": _article_no(lines[s]),
+        }
+        for s, e in spans
+    ]
+
+
+def _children_from_parent(parent: ParentChunk, use_llm: bool = True) -> list[ChildChunk]:
+    lines = [line for line in parent.content.splitlines() if line.strip()]
+    if not lines:
+        return []
+    if parent.chunk_type == "text" and len(lines) == 1 and _looks_like_heading(lines[0]) and not _article_no(lines[0]):
+        return []
+    boundaries = _llm_child_boundaries(parent) if use_llm and parent.chunk_type == "text" else []
+    if not boundaries:
+        boundaries = _rule_child_boundaries(parent)
+
+    children: list[ChildChunk] = []
+    seen_spans: set[tuple[int, int]] = set()
+    for boundary in boundaries:
+        start = int(boundary["start_line"]) - 1
+        end = int(boundary["end_line"]) - 1
+        if start < 0 or end < start or end >= len(lines):
+            continue
+        span = (start, end)
+        if span in seen_spans:
+            continue
+        seen_spans.add(span)
+        content = _clean_text("\n".join(lines[start : end + 1]))
+        if len(content) < CHILD_MIN_CHARS and parent.chunk_type != "table":
+            continue
+        article = str(boundary.get("article_no") or _article_no(content))
+        child_type = str(boundary.get("chunk_type") or parent.chunk_type)
+        title = str(boundary.get("title") or parent.title)
+        metadata = dict(parent.metadata)
+        if child_type == "table":
+            row_numbers = [
+                int(m.group(1))
+                for line in lines[start : end + 1]
+                if (m := re.match(r"^第(\d+)行:", line.strip()))
+            ]
+            if row_numbers:
+                metadata["row_range"] = f"{min(row_numbers)}-{max(row_numbers)}"
+        children.append(
+            ChildChunk(
+                child_id=_safe_id("c_"),
+                parent_id=parent.parent_id,
+                doc_name=parent.doc_name,
+                source_path=parent.source_path,
+                title=title,
+                heading_path=parent.heading_path,
+                content=content,
+                chunk_type=child_type,
+                page_no=parent.page_no,
+                article_no=article,
+                metadata=metadata,
+            )
+        )
+    return children
 
 
 def _ollama_embed(texts: list[str]) -> list[list[float]]:
-    """通过 Ollama API 获取 bge-m3 向量嵌入（GPU 加速）
-
-    Args:
-        texts: 文本列表（批量最多 50 条）
-
-    Returns:
-        向量列表，每项为 1024 维 embedding
-    """
-    try:
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(
-                f"{OLLAMA_BASE}/api/embed",
-                json={"model": EMBED_MODEL, "input": texts},
-            )
-        if resp.status_code == 200:
-            return resp.json()["embeddings"]
+    if not texts:
         return []
+    try:
+        with httpx.Client(timeout=90.0) as client:
+            resp = client.post(f"{OLLAMA_BASE}/api/embed", json={"model": EMBED_MODEL, "input": texts})
+        if resp.status_code == 200:
+            payload = resp.json()
+            return payload.get("embeddings", [])
     except Exception:
         return []
+    return []
 
 
 class _OllamaEmbeddingFunction:
-    """ChromaDB 兼容的嵌入函数 — 通过 Ollama bge-m3 生成向量"""
-
-    def __init__(self) -> None:
-        pass
-
     def __call__(self, input: list[str]) -> list[list[float]]:
         return _ollama_embed(input)
 
@@ -100,533 +706,279 @@ class _OllamaEmbeddingFunction:
         return f"ollama_{EMBED_MODEL}"
 
 
-# ══════════════════════════════════════════════════════
-#  1. 文档清洗
-# ══════════════════════════════════════════════════════
-
-def _clean_text(text: str) -> str:
-    """清洗文本：去多余空格/空行/控制字符"""
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
-    text = re.sub(r" {2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    lines = [l.strip() for l in text.split("\n")]
-    return "\n".join(lines)
+def _tokenize(text: str) -> list[str]:
+    chinese = re.findall(r"[\u4e00-\u9fff]{1,2}", text)
+    words = re.findall(r"[A-Za-z0-9_]+", text.lower())
+    return [t for t in chinese + words if t.strip()]
 
 
 def extract_docx_text(docx_path: str | Path) -> str:
-    """从 DOCX 提取并清洗文本"""
-    from docx import Document
-
-    doc = Document(str(docx_path))
-    parts: list[str] = []
-    table_count = 0
-
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-        style_name = para.style.name if para.style else ""
-        is_heading = "heading" in style_name.lower() if style_name else False
-
-        has_chapter = bool(re.match(r"^第[一二三四五六七八九十\d]+[章节条]", text))
-        is_stage = bool(re.match(r"^第[一二三四五六七八九十\d]+阶段", text))
-        is_article = bool(re.match(r"^第[一二三四五六七八九十\d]+条", text))
-        is_section = bool(re.match(r"^[一二三四五六七八九十\d]+[、．.]", text)) and len(text) < 50
-
-        if is_heading or has_chapter or is_stage:
-            parts.append(f"\n## {text}\n")
-        elif is_article:
-            parts.append(f"\n### {text}\n")
-        elif is_section and len(text) < 50:
-            parts.append(f"\n### {text}\n")
-        else:
-            parts.append(text)
-
-    # 表格
-    for table in doc.tables:
-        table_count += 1
-        parts.append(f"\n--- 表格{table_count} ---")
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            parts.append(" | ".join(cells))
-
-    raw = "\n".join(parts)
-    return _clean_text(raw)
+    elements = _load_docx_elements(docx_path)
+    return "\n".join(e.text for e in elements if e.element_type != "table")
 
 
-# ══════════════════════════════════════════════════════
-#  2. LLM 语义分块
-# ══════════════════════════════════════════════════════
+def _extract_interleaved(docx_path: str | Path) -> dict[str, Any]:
+    elements = _load_docx_elements(docx_path)
+    paragraph_text = "\n".join(e.text for e in elements if e.element_type != "table")
+    tables = [e.metadata for e in elements if e.element_type == "table"]
+    return {"paragraph_text": paragraph_text, "tables": tables}
 
-def _call_llm(system: str, prompt: str, max_tokens: int = 4096) -> str:
-    """调用配置的 LLM API（OpenAI-compatible）"""
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
 
-    body = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
+def _save_parent_index(parents: list[ParentChunk], skipped_files: list[Path], use_llm: bool) -> None:
+    RUNTIME_KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 2,
+        "build_at": date.today().isoformat(),
+        "parents": [p.to_dict() for p in parents],
+        "skipped_files": [str(p) for p in skipped_files],
+        "models": {
+            "chunk_model": CHUNK_MODEL,
+            "embed_model": EMBED_MODEL,
+            "vision_model": VISION_MODEL,
+            "use_llm_chunking": str(use_llm),
+        },
     }
+    PARENT_INDEX_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
+def _load_parent_index() -> dict[str, ParentChunk]:
+    if not PARENT_INDEX_FILE.exists():
+        return {}
     try:
-        with httpx.Client(timeout=120.0) as client:
-            resp = client.post(
-                f"{API_BASE}/chat/completions",
-                headers=headers,
-                json=body,
-            )
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
-        return ""
+        payload = json.loads(PARENT_INDEX_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return ""
-
-
-_CHUNKING_SYSTEM_PROMPT = """你是高校党务文档处理专家。你的任务是将一段党务工作手册文本按**语义边界**分割成独立的、语义完整的知识块。
-
-## 文档类型
-这是《贵州师范大学组织发展工作专项培训工作手册》，包含以下内容：
-1. **中国共产党支部工作条例（试行）** — 党支部设置、基本任务、工作机制、组织生活、委员会建设
-2. **中国共产党党员教育管理工作条例** — 党员教育基本任务、日常管理、党籍管理、监督处置
-3. **中国共产党普通高等学校基层组织工作条例** — 高校党委/院系党组织设置与职责
-4. **党费管理** — 党费缴纳、使用、管理
-5. **中国共产党发展党员工作细则** — 发展党员各环节要求
-6. **贵州省发展党员工作规程（试行）** — 25步具体流程（最关键部分）
-7. **贵州师范大学发展党员工作规范** — 公示制度、入党志愿书管理、预审登记
-8. **工作模板/表格** — 会议记录模板、考察登记表、预审表等
-
-## 分块规则
-1. 每个知识块必须是**完整的语义单元**（一个完整的条款、步骤、定义或模板说明）。
-2. **必须尊重文档结构边界**：不同法规/文件的内容分开；不同章节分开；法规正文与附件模板分开。
-3. 以 `[CHUNK]` 标记每个块的开始，后面跟块标题（`## 标题`），然后换行写内容。
-4. **不要在句子中间切分**——在句号、段落结束处切分。
-5. 每个块长度控制在 **150~1500 字**之间。
-6. 标题格式建议：
-   - 法规类：`支部工作条例·第一章 总则`
-   - 流程类：`发展党员规程·第1步 递交申请书`
-   - 制度类：`贵州师范大学·公示制度`
-   - 模板类：`工作模板·支委会会议记录`
-
-输出格式示例：
-[CHUNK]
-## 发展党员规程·第1步 递交入党申请书
-年满十八岁的中国工人、农民、军人、知识分子和其他社会阶层的先进分子，承认党的纲领和章程，愿意参加党的一个组织并在其中积极工作、执行党的决议和按期交纳党费的，可以申请加入中国共产党。入党申请人应当向工作、学习所在单位党组织提出入党申请……
-
-[CHUNK]
-## 发展党员规程·第7步 确定发展对象
-对经过一年以上培养教育和考察、基本具备党员条件的入党积极分子，在听取党小组、培养联系人、党员和群众意见的基础上，支部委员会讨论同意并报上级党委备案后，可列为发展对象。
-"""
-
-
-def _llm_chunk(text: str) -> list[dict]:
-    """使用 LLM 进行语义分块
-
-    Returns:
-        [{"title": "...", "content": "..."}, ...]
-    """
-    # 如果 LLM 不可用（本地无模型），回退到基于规则的分块
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            resp = client.get(f"{API_BASE}/models")
-            if resp.status_code != 200:
-                return _rule_chunk(text)
-    except Exception:
-        return _rule_chunk(text)
-
-    # 将长文本分批送入 LLM（每批约 4000 字的重叠窗口）
-    all_chunks: list[dict] = []
-    batch_size = 4000
-    overlap = 500
-
-    idx = 0
-    while idx < len(text):
-        batch = text[idx : idx + batch_size]
-        if len(batch) < 200:
-            # 最后一个小片段，追加到上一个块
-            if all_chunks:
-                all_chunks[-1]["content"] += "\n" + batch
-            break
-
-        result = _call_llm(_CHUNKING_SYSTEM_PROMPT, batch, max_tokens=2048)
-        if not result:
-            # LLM 失败，回退规则分块
-            all_chunks = _rule_chunk(text)
-            break
-
-        # 解析 [CHUNK] 标记
-        batch_chunks: list[dict] = []
-        for block in re.split(r"\[CHUNK\]\s*", result):
-            block = block.strip()
-            if not block:
-                continue
-            # 提取标题
-            title_match = re.match(r"^##\s+(.+?)(?:\n|$)", block)
-            title = title_match.group(1).strip() if title_match else f"党务规程·第{len(all_chunks)+len(batch_chunks)+1}段"
-            content = block
-            if title_match:
-                content = block[title_match.end():].strip()
-            if len(content) >= CHUNK_MIN_CHARS:
-                batch_chunks.append({"title": title, "content": content})
-
-        # 去重：如果上一批的最后一个块和当前批的第一个块内容相似，合并
-        if all_chunks and batch_chunks:
-            last_title = all_chunks[-1]["title"]
-            first_title = batch_chunks[0]["title"]
-            if last_title == first_title:
-                all_chunks[-1]["content"] += "\n" + batch_chunks[0]["content"]
-                batch_chunks = batch_chunks[1:]
-
-        all_chunks.extend(batch_chunks)
-        idx += batch_size - overlap
-
-    # 如果没有解析出任何块，回退规则分块
-    if not all_chunks:
-        all_chunks = _rule_chunk(text)
-
-    return all_chunks
-
-
-def _rule_chunk(text: str) -> list[dict]:
-    """基于规则的标题分块（LLM 不可用时的回退方案）"""
-    lines = text.split("\n")
-    chunks: list[dict] = []
-    current_title = "文档开头"
-    current_content: list[str] = []
-
-    def flush():
-        if current_content:
-            body = "\n".join(current_content).strip()
-            if len(body) >= CHUNK_MIN_CHARS:
-                chunks.append({"title": current_title, "content": body})
-            elif chunks and len(body) > 30:
-                chunks[-1]["content"] += "\n" + body
-
-    for line in lines:
-        heading_match = re.match(r"^##\s+(.+)$", line)
-        if heading_match:
-            flush()
-            current_title = heading_match.group(1).strip()
-            current_content = []
-        else:
-            current_content.append(line)
-    flush()
-
-    # 对过大的 chunk 做二次分割（按双换行）
-    final_chunks: list[dict] = []
-    for c in chunks:
-        if len(c["content"]) > CHUNK_MAX_CHARS:
-            sub_parts = re.split(r"\n\n+", c["content"])
-            buffer = ""
-            for part in sub_parts:
-                if len(buffer) + len(part) > CHUNK_MAX_CHARS and buffer:
-                    final_chunks.append({"title": c["title"], "content": buffer.strip()})
-                    buffer = part
-                else:
-                    buffer += "\n\n" + part if buffer else part
-            if buffer.strip():
-                final_chunks.append({"title": c["title"], "content": buffer.strip()})
-        else:
-            final_chunks.append(c)
-
-    return final_chunks
-
-
-# ══════════════════════════════════════════════════════
-#  3. LLM Re-ranker
-# ══════════════════════════════════════════════════════
-
-_RERANK_SYSTEM_PROMPT = """你是党务知识检索的精确排序专家。你的任务是评估给定文档段落对用户查询的相关性。
-
-要求：
-1. 对每个段落，仅基于**内容相关性**给出 0-10 分：
-   - 0-2: 完全不相关
-   - 3-4: 弱相关（提到相关术语但不是用户要的信息）
-   - 5-6: 中等相关（部分回答了问题但有偏差）
-   - 7-8: 强相关（直接回答用户问题）
-   - 9-10: 完全匹配（精确回答了用户查询的核心需求）
-2. 考虑党务工作的专业性：术语匹配、流程对应关系、政策法规的准确性。
-3. 输出格式严格为每行一个：`段落ID: 分数`
-4. 只输出评分结果，不要额外说明。"""
-
-
-def _llm_rerank(chunks: list[dict], query: str, top_k: int = 5) -> list[dict]:
-    """使用 LLM 对检索结果进行二次精排
-
-    Args:
-        chunks: 候选列表，每项含 title, content, score 等
-        query: 用户查询
-        top_k: 返回 top-k 条
-
-    Returns:
-        重排序后的列表，每项新增 rerank_score 字段
-    """
-    if not chunks:
-        return []
-
-    # 构建评分输入：截断过长的 content
-    candidates_text = ""
-    for i, c in enumerate(chunks):
-        content_preview = c["content"][:200].strip()
-        if len(c["content"]) > 200:
-            content_preview += "…"
-        candidates_text += f"[{i}] 标题: {c['title']}\n    内容: {content_preview}\n\n"
-
-    prompt = f"""用户查询：{query}
-
-候选段落：
-{candidates_text}
-
-请为每个段落评分（0-10），每行一个：段落ID: 分数"""
-
-    result = _call_llm(_RERANK_SYSTEM_PROMPT, prompt, max_tokens=1024)
-    if not result:
-        # LLM 失败，保持原顺序
-        for c in chunks:
-            c["rerank_score"] = c.get("score", 0.0)
-        return chunks[:top_k]
-
-    # 解析评分
-    score_map: dict[int, float] = {}
-    for line in result.strip().split("\n"):
-        line = line.strip()
-        m = re.match(r"^\[?(\d+)\]?\s*[:：]\s*(\d+(?:\.\d+)?)", line)
-        if m:
-            idx = int(m.group(1))
-            score = float(m.group(2))
-            if 0 <= idx < len(chunks):
-                score_map[idx] = score
-
-    # 应用评分
-    for i, c in enumerate(chunks):
-        c["rerank_score"] = score_map.get(i, c.get("score", 0.0))
-
-    # 按 rerank_score 降序排列
-    ranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
-
-    # 更新 score 为 rerank_score
-    for c in ranked:
-        c["score"] = round(c["rerank_score"], 4)
-        c["source"] = "hybrid+rerank"
-
-    return ranked[:top_k]
-
-
-# ══════════════════════════════════════════════════════
-#  3B. Cross-Encoder 精排
-# ══════════════════════════════════════════════════════
-
-_CE_MODEL = None
-
-
-def _get_ce_model():
-    """延迟加载 CrossEncoder 模型（BAAI/bge-reranker-v2-m3）"""
-    global _CE_MODEL
-    if _CE_MODEL is None:
-        from sentence_transformers import CrossEncoder
-        print(f"[RAG] 加载 CrossEncoder 模型: {RERANK_MODEL_NAME} ...", file=sys.stderr)
-        _CE_MODEL = CrossEncoder(RERANK_MODEL_NAME, device="cuda", max_length=512)
-        print("[RAG] CrossEncoder 加载完成", file=sys.stderr)
-    return _CE_MODEL
-
-
-def _ce_rerank(chunks: list[dict], query: str, top_k: int = 5) -> list[dict]:
-    """使用 Cross-Encoder 模型进行二次精排
-
-    bge-reranker-v2-m3 直接将 (query, passage) 对输入，输出相关性分数。
-    比 LLM 精排快 10-50 倍，比分词匹配更精准。
-
-    Args:
-        chunks: 候选列表
-        query: 用户查询
-        top_k: 返回 top-k 条
-
-    Returns:
-        重排序后的列表
-    """
-    if not chunks:
-        return []
-
-    try:
-        model = _get_ce_model()
-        # 构建 (query, passage) 对（截断 content 到 500 字以加速）
-        pairs = [(query, f"{c['title']}\n{c['content'][:500]}") for c in chunks]
-        # 批量评分（自动 batch）
-        scores = model.predict(pairs)
-
-        for i, c in enumerate(chunks):
-            score = float(scores[i])
-            c["rerank_score"] = score
-            c["score"] = round(score, 4)
-            c["source"] = "hybrid+rerank(ce)"
-
-        ranked = sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)
-        return ranked[:top_k]
-    except Exception as e:
-        # Cross-Encoder 失败，回退到 LLM 精排
-        print(f"[WARN] Cross-Encoder 精排失败 ({e})，回退到 LLM 精排", file=sys.stderr)
-        return _llm_rerank(chunks, query, top_k=top_k)
-
-
-# ══════════════════════════════════════════════════════
-#  4. 知识库构建（DOCX → 分块 → 索引）
-# ══════════════════════════════════════════════════════
-
-def _tokenize(text: str) -> list[str]:
-    """中文分词 + 英文小写 + 标点清理"""
-    text = re.sub(r"[^\u4e00-\u9fff\w]", " ", text)
-    tokens = text.lower().split()
-    return [t for t in tokens if len(t) > 1]
-
-
-def build_knowledge_base(docx_path: str | Path | None = None) -> dict:
-    """构建知识库：DOCX → 清洗 → 语义分块 → ChromaDB + BM25 索引
-
-    Args:
-        docx_path: DOCX 文件路径。None 则使用默认路径。
-
-    Returns:
-        {"status": "ok"|"skipped"|"error", "chunks": N, "message": "..."}
-    """
-    if docx_path is None:
-        docx_path = HERE.parent / "知识库" / "（7.21）贵州师范大学组织发展工作专项培训工作手册.docx"
-    docx_path = Path(docx_path)
-
-    if not docx_path.exists():
-        return {"status": "error", "chunks": 0, "message": f"DOCX 文件不存在: {docx_path}"}
-
-    # 检查是否需要重建
-    if CHROMA_DIR.exists():
+        return {}
+    parents = payload.get("parents", [])
+    out: dict[str, ParentChunk] = {}
+    for item in parents:
         try:
-            client = chromadb.PersistentClient(str(CHROMA_DIR))
-            collection = client.get_collection("party_rules")
-            count = collection.count()
-            if count > 0:
-                return {"status": "skipped", "chunks": count, "message": "知识库已存在，无需重建"}
+            parent = ParentChunk.from_dict(item)
         except Exception:
-            pass
+            continue
+        out[parent.parent_id] = parent
+    return out
 
-    # 1. 提取并清洗
-    print("[RAG] 提取 DOCX 文本...", file=sys.stderr)
-    raw_text = extract_docx_text(docx_path)
-    if not raw_text.strip():
-        return {"status": "error", "chunks": 0, "message": "DOCX 提取为空"}
-    print(f"[RAG] 提取完成：{len(raw_text)} 字符", file=sys.stderr)
 
-    # 2. 语义分块
-    print("[RAG] 开始 LLM 语义分块（大文档自动分批处理）...", file=sys.stderr)
-    chunks = _llm_chunk(raw_text)
-    print(f"[RAG] 分块完成：{len(chunks)} 个语义块", file=sys.stderr)
+def _build_chunks_from_files(files: list[Path], use_llm: bool = True) -> tuple[list[ParentChunk], list[ChildChunk], dict[str, int]]:
+    parents: list[ParentChunk] = []
+    children: list[ChildChunk] = []
+    stats = {"documents": 0, "parents": 0, "children": 0, "tables": 0, "errors": 0}
+    for source in files:
+        try:
+            elements = _load_document_elements(source)
+        except Exception as exc:
+            stats["errors"] += 1
+            print(f"[RAG] 跳过解析失败文件: {source.name} ({exc})", file=sys.stderr)
+            continue
+        if not elements:
+            continue
+        stats["documents"] += 1
+        doc_parents = _elements_to_parents(elements)
+        parents.extend(doc_parents)
+        for parent in doc_parents:
+            if parent.chunk_type == "table":
+                stats["tables"] += 1
+            children.extend(_children_from_parent(parent, use_llm=use_llm))
+    stats["parents"] = len(parents)
+    stats["children"] = len(children)
+    return parents, children, stats
 
-    # 3. 构建 ChromaDB 索引（使用 Ollama bge-m3 嵌入，GPU 加速）
-    print("[RAG] 构建 ChromaDB 向量索引（Ollama bge-m3 > GPU）...", file=sys.stderr)
+
+def build_knowledge_base(docx_path: str | Path | None = None, use_llm: bool | None = None) -> dict[str, Any]:
+    """Build the parent/child knowledge base.
+
+    Passing a file path keeps the old single-file behavior. Passing None scans
+    the repository-level Chinese knowledge directory.
+    """
+    supported_files, skipped_files = _discover_knowledge_files(docx_path)
+    if not supported_files:
+        target = Path(docx_path) if docx_path else SOURCE_KNOWLEDGE_DIR
+        return {"status": "error", "chunks": 0, "message": f"未找到可解析知识库文件: {target}"}
+
+    if use_llm is None:
+        use_llm = USE_LLM_CHUNKING
+    mode = "LLM 语义边界" if use_llm else "规则语义边界"
+    print(f"[RAG] 发现 {len(supported_files)} 个知识库文件，跳过 {len(skipped_files)} 个旧格式文件，分割模式：{mode}", file=sys.stderr)
+    parents, children, stats = _build_chunks_from_files(supported_files, use_llm=use_llm)
+    if not children:
+        return {"status": "error", "chunks": 0, "message": "知识库分块为空"}
+
+    RUNTIME_KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(str(CHROMA_DIR))
-    # 删除旧 collection 重新创建
     try:
         client.delete_collection("party_rules")
     except Exception:
         pass
     collection = client.create_collection("party_rules")
 
-    documents = [c["content"] for c in chunks]
-    metadatas = [{"title": c["title"], "idx": str(i)} for i, c in enumerate(chunks)]
-    ids = [str(uuid.uuid4())[:12] for _ in chunks]
+    build_at = date.today().isoformat()
+    documents = [child.content for child in children]
+    embedding_documents = [child.embedding_text for child in children]
+    ids = [child.child_id for child in children]
+    metadatas = [child.to_metadata(i, build_at) for i, child in enumerate(children)]
 
-    # 批量添加（每次 10 条，Ollama 嵌入）
-    batch_size = 10
-    for i in range(0, len(documents), batch_size):
-        end = min(i + batch_size, len(documents))
-        batch_docs = documents[i:end]
-        batch_metadatas = metadatas[i:end]
-        batch_ids = ids[i:end]
-
-        # 用 Ollama bge-m3 预计算嵌入向量
-        embeddings = _ollama_embed(batch_docs)
-        if not embeddings:
-            # Ollama 不可用时，回退到 ChromaDB 默认 ONNX
-            print(f"  [WARN] Ollama 嵌入失败，批次 {i//batch_size + 1} 使用默认 ONNX 回退", file=sys.stderr)
-            collection.add(
-                documents=batch_docs,
-                metadatas=batch_metadatas,
-                ids=batch_ids,
-            )
+    print(f"[RAG] 构建向量索引：{len(children)} 个 child chunks", file=sys.stderr)
+    batch_size = 16
+    for start in range(0, len(documents), batch_size):
+        end = min(start + batch_size, len(documents))
+        batch_docs = documents[start:end]
+        batch_embedding_docs = embedding_documents[start:end]
+        batch_meta = metadatas[start:end]
+        batch_ids = ids[start:end]
+        embeddings = _ollama_embed(batch_embedding_docs)
+        if embeddings and len(embeddings) == len(batch_docs):
+            collection.add(documents=batch_docs, metadatas=batch_meta, ids=batch_ids, embeddings=embeddings)
         else:
-            collection.add(
-                documents=batch_docs,
-                embeddings=embeddings,
-                metadatas=batch_metadatas,
-                ids=batch_ids,
-            )
-
-        progress = min(100, int((end / len(documents)) * 100))
+            print(f"[WARN] Ollama 嵌入失败，批次 {start // batch_size + 1} 使用 Chroma 默认嵌入回退", file=sys.stderr)
+            collection.add(documents=batch_docs, metadatas=batch_meta, ids=batch_ids)
+        progress = min(100, int(end / len(documents) * 100))
         print(f"  [RAG] 向量化进度: {progress}% ({end}/{len(documents)})", file=sys.stderr)
 
-    # 4. 构建 BM25 索引
-    print("[RAG] 构建 BM25 关键词索引...", file=sys.stderr)
-    bm25_data = {
-        "documents": documents,
-        "metadatas": metadatas,
-        "ids": ids,
-    }
     CHUNK_INDEX_FILE.write_text(
-        json.dumps(bm25_data, ensure_ascii=False, indent=2),
+        json.dumps({"version": 2, "documents": documents, "metadatas": metadatas, "ids": ids}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _save_parent_index(parents, skipped_files, use_llm)
 
-    print(f"[RAG] 构建完成：{len(chunks)} 个语义块", file=sys.stderr)
+    skipped_note = f"，跳过旧 .doc 文件 {len(skipped_files)} 个" if skipped_files else ""
+    message = (
+        f"知识库构建完成：文档 {stats['documents']} 个，parent {len(parents)} 个，"
+        f"child {len(children)} 个，表格 parent {stats['tables']} 个{skipped_note}"
+    )
+    print(f"[RAG] {message}", file=sys.stderr)
     return {
         "status": "ok",
-        "chunks": len(chunks),
-        "message": f"知识库构建完成，共 {len(chunks)} 个语义块",
+        "chunks": len(children),
+        "parents": len(parents),
+        "documents": stats["documents"],
+        "table_parents": stats["tables"],
+        "skipped": len(skipped_files),
+        "message": message,
     }
 
 
-# ══════════════════════════════════════════════════════
-#  5. VectorRAG — 混合检索引擎
-# ══════════════════════════════════════════════════════
+_ce_model = None
+
+
+def _get_ce_model():
+    global _ce_model
+    if _ce_model is None:
+        from sentence_transformers import CrossEncoder
+
+        _ce_model = CrossEncoder(RERANK_MODEL_NAME)
+    return _ce_model
+
+
+_RERANK_SYSTEM_PROMPT = """你是党务知识检索的精确排序专家。
+请只输出每行一个 `段落ID: 分数`，分数 0-10，按内容是否能回答用户查询评分。
+"""
+
+
+def _llm_rerank(chunks: list[dict[str, Any]], query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    if not chunks:
+        return []
+    candidates = []
+    for i, chunk in enumerate(chunks, 1):
+        candidates.append(f"段落{i}: {chunk['title']}\n{chunk['content'][:700]}")
+    prompt = f"用户查询：{query}\n\n" + "\n\n".join(candidates)
+    result = _call_llm(_RERANK_SYSTEM_PROMPT, prompt, max_tokens=512, model=MODEL)
+    scores: dict[int, float] = {}
+    for line in result.splitlines():
+        match = re.search(r"段落\s*(\d+)\s*[:：]\s*([0-9.]+)", line)
+        if match:
+            scores[int(match.group(1)) - 1] = float(match.group(2))
+    for i, chunk in enumerate(chunks):
+        score = scores.get(i, chunk.get("score", 0.0) * 10)
+        chunk["rerank_score"] = score
+        chunk["score"] = round(score / 10, 4)
+        chunk["source"] = "hybrid+rerank(llm)"
+    return sorted(chunks, key=lambda x: x.get("rerank_score", 0), reverse=True)[:top_k]
+
+
+def _ce_rerank(chunks: list[dict[str, Any]], query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    if not chunks:
+        return []
+    try:
+        model = _get_ce_model()
+        pairs = [(query, f"{c['title']}\n{c['content'][:700]}") for c in chunks]
+        scores = model.predict(pairs)
+        for i, chunk in enumerate(chunks):
+            score = float(scores[i])
+            chunk["rerank_score"] = score
+            chunk["score"] = round(score, 4)
+            chunk["source"] = "hybrid+rerank(ce)"
+        return sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)[:top_k]
+    except Exception as exc:
+        print(f"[WARN] Cross-Encoder 精排失败 ({exc})，回退到 LLM/融合排序", file=sys.stderr)
+        return _llm_rerank(chunks, query, top_k=top_k)
+
 
 class VectorRAG:
-    """混合检索引擎：ChromaDB（稠密）+ BM25（稀疏）+ LLM Rerank（精排）"""
-
     def __init__(self) -> None:
         self._chroma_collection = None
         self._bm25: BM25Okapi | None = None
-        self._bm25_docs: list[dict] = []
+        self._bm25_docs: list[dict[str, Any]] = []
+        self._parents: dict[str, ParentChunk] = {}
         self._initialized = False
 
+    def _load_bm25(self) -> None:
+        self._bm25 = None
+        self._bm25_docs = []
+        if not CHUNK_INDEX_FILE.exists():
+            return
+        data = json.loads(CHUNK_INDEX_FILE.read_text(encoding="utf-8"))
+        documents = data.get("documents", [])
+        metadatas = data.get("metadatas", [])
+        ids = data.get("ids", [])
+        tokenized = [_tokenize(doc) for doc in documents]
+        self._bm25 = BM25Okapi(tokenized) if tokenized else None
+        self._bm25_docs = [
+            {"content": doc, "metadata": meta, "id": doc_id}
+            for doc, meta, doc_id in zip(documents, metadatas, ids)
+        ]
+
+    def _load_parents(self) -> None:
+        self._parents = _load_parent_index()
+
     def _ensure_initialized(self) -> bool:
-        """延迟初始化：加载 ChromaDB 和 BM25"""
         if self._initialized:
             return True
-
         if not CHROMA_DIR.exists():
             return False
-
         try:
             client = chromadb.PersistentClient(str(CHROMA_DIR))
             self._chroma_collection = client.get_collection("party_rules")
-
-            if CHUNK_INDEX_FILE.exists():
-                data = json.loads(CHUNK_INDEX_FILE.read_text(encoding="utf-8"))
-                tokenized = [_tokenize(d) for d in data["documents"]]
-                self._bm25 = BM25Okapi(tokenized)
-                self._bm25_docs = [
-                    {"content": d, "metadata": m, "id": i}
-                    for d, m, i in zip(
-                        data["documents"], data["metadatas"], data["ids"]
-                    )
-                ]
-
+            self._load_bm25()
+            self._load_parents()
             self._initialized = True
             return True
         except Exception:
             return False
+
+    def _with_parent_context(self, item: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        meta = metadata or item.get("metadata") or {}
+        parent_id = meta.get("parent_id") or item.get("parent_id", "")
+        parent = self._parents.get(parent_id)
+        context = ""
+        if parent:
+            context = parent.content[:900].strip()
+            if len(parent.content) > 900:
+                context += "..."
+        citation = meta.get("citation") or item.get("citation") or item.get("title", "")
+        item.update(
+            {
+                "parent_id": parent_id,
+                "doc_name": meta.get("doc_name", ""),
+                "heading_path": meta.get("heading_path", ""),
+                "article_no": meta.get("article_no", ""),
+                "chunk_type": meta.get("chunk_type", "text"),
+                "citation": citation,
+                "parent_context": context,
+                "metadata": meta,
+            }
+        )
+        return item
 
     def search(
         self,
@@ -634,207 +986,199 @@ class VectorRAG:
         top_k: int = DEFAULT_TOP_K,
         alpha: float = HYBRID_ALPHA,
         rerank: bool = DEFAULT_RERANK,
-    ) -> list[dict]:
-        """三阶段混合检索：稠密 → 稀疏 → 融合 → 精排
-
-        Args:
-            query: 查询文本
-            top_k: 返回结果数
-            alpha: 稠密检索权重 [0,1]，1=纯向量，0=纯BM25
-            rerank: 是否启用 LLM 重排
-
-        Returns:
-            [{"title": "...", "content": "...", "score": 0.85,
-              "source": "hybrid|hybrid+rerank"}, ...]
-        """
+    ) -> list[dict[str, Any]]:
         if not self._ensure_initialized():
             return []
 
         candidate_k = HYBRID_TOP_K if rerank else top_k
-
-        # ── 稠密检索（Ollama bge-m3 预计算查询向量） ──
-        dense_results: dict[str, dict] = {}
+        dense_results: dict[str, dict[str, Any]] = {}
         try:
             query_embedding = _ollama_embed([query])
-            if not query_embedding:
-                # Ollama 不可用时，回退到文本查询（使用默认 ONNX）
-                resp = self._chroma_collection.query(
-                    query_texts=[query],
-                    n_results=candidate_k + 5,
-                    include=["documents", "metadatas", "distances"],
-                )
-            else:
+            if query_embedding:
                 resp = self._chroma_collection.query(
                     query_embeddings=query_embedding,
                     n_results=candidate_k + 5,
                     include=["documents", "metadatas", "distances"],
                 )
-            if resp["ids"] and resp["ids"][0]:
-                for i, doc_id in enumerate(resp["ids"][0]):
-                    dist = resp["distances"][0][i] if resp.get("distances") else 1.0
-                    sim = max(0.0, 1.0 - dist / 2.0)
-                    dense_results[doc_id] = {
+            else:
+                resp = self._chroma_collection.query(
+                    query_texts=[query],
+                    n_results=candidate_k + 5,
+                    include=["documents", "metadatas", "distances"],
+                )
+            for i, doc_id in enumerate(resp.get("ids", [[]])[0]):
+                meta = resp["metadatas"][0][i]
+                dist = resp["distances"][0][i] if resp.get("distances") else 1.0
+                sim = max(0.0, 1.0 - float(dist) / 2.0)
+                dense_results[doc_id] = self._with_parent_context(
+                    {
                         "id": doc_id,
-                        "title": resp["metadatas"][0][i].get("title", "未知"),
+                        "title": meta.get("title", "未知"),
                         "content": resp["documents"][0][i],
                         "dense_score": round(sim, 4),
-                    }
+                    },
+                    meta,
+                )
         except Exception:
             pass
 
-        # ── 稀疏检索（BM25） ──
-        sparse_results: dict[str, dict] = {}
+        sparse_results: dict[str, dict[str, Any]] = {}
         if self._bm25 and self._bm25_docs:
-            tokenized_query = _tokenize(query)
-            if tokenized_query:
-                scores = self._bm25.get_scores(tokenized_query)
-                max_score = max(scores) if max(scores) > 0 else 1.0
-                for i, score in enumerate(scores):
-                    if score > 0:
-                        doc = self._bm25_docs[i]
-                        doc_id = doc["id"]
-                        sparse_results[doc_id] = {
-                            "id": doc_id,
-                            "title": doc["metadata"]["title"],
+            tokens = _tokenize(query)
+            if tokens:
+                scores = self._bm25.get_scores(tokens)
+                max_score = max(scores) if len(scores) and max(scores) > 0 else 1.0
+                ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[: candidate_k + 5]
+                for i, score in ranked:
+                    if score <= 0:
+                        continue
+                    doc = self._bm25_docs[i]
+                    meta = doc["metadata"]
+                    sparse_results[doc["id"]] = self._with_parent_context(
+                        {
+                            "id": doc["id"],
+                            "title": meta.get("title", "未知"),
                             "content": doc["content"],
-                            "sparse_score": round(score / max_score, 4),
-                        }
+                            "sparse_score": round(float(score) / float(max_score), 4),
+                        },
+                        meta,
+                    )
 
-        # ── 融合 ──
-        all_ids = set(dense_results.keys()) | set(sparse_results.keys())
-        fused: list[dict] = []
-        for doc_id in all_ids:
-            d = dense_results.get(doc_id, {})
-            s = sparse_results.get(doc_id, {})
-            dense_score = d.get("dense_score", 0.0)
-            sparse_score = s.get("sparse_score", 0.0)
-            hybrid_score = alpha * dense_score + (1 - alpha) * sparse_score
+        fused: list[dict[str, Any]] = []
+        all_ids = list(set(dense_results) | set(sparse_results))
 
-            fused.append({
-                "id": doc_id,
-                "title": d.get("title") or s.get("title", "未知"),
-                "content": d.get("content") or s.get("content", ""),
-                "score": round(hybrid_score, 4),
-                "dense_score": dense_score,
-                "sparse_score": sparse_score,
-                "source": "hybrid",
-            })
+        if FUSION_MODE == "rrf":
+            # ── RRF (Reciprocal Rank Fusion) ──
+            dense_ranked = sorted(
+                dense_results.items(), key=lambda x: x[1].get("dense_score", 0), reverse=True
+            )
+            sparse_ranked = sorted(
+                sparse_results.items(), key=lambda x: x[1].get("sparse_score", 0), reverse=True
+            )
+            dense_ranks = {doc_id: idx for idx, (doc_id, _) in enumerate(dense_ranked)}
+            sparse_ranks = {doc_id: idx for idx, (doc_id, _) in enumerate(sparse_ranked)}
 
+            for doc_id in all_ids:
+                d = dense_results.get(doc_id, {})
+                s = sparse_results.get(doc_id, {})
+                base = d or s
+                dr = dense_ranks.get(doc_id, len(dense_ranked))
+                sr = sparse_ranks.get(doc_id, len(sparse_ranked))
+                rrf_score = 1.0 / (RRF_K + dr) + 1.0 / (RRF_K + sr)
+                fused.append({
+                    **base,
+                    "id": doc_id,
+                    "title": base.get("title", "未知"),
+                    "content": base.get("content", ""),
+                    "score": round(rrf_score, 4),
+                    "dense_score": d.get("dense_score", 0.0),
+                    "sparse_score": s.get("sparse_score", 0.0),
+                    "source": "hybrid+rrf",
+                })
+        else:
+            # ── 原始线性加权融合 ──
+            for doc_id in all_ids:
+                d = dense_results.get(doc_id, {})
+                s = sparse_results.get(doc_id, {})
+                base = d or s
+                dense_score = d.get("dense_score", 0.0)
+                sparse_score = s.get("sparse_score", 0.0)
+                hybrid_score = alpha * dense_score + (1 - alpha) * sparse_score
+                fused.append({
+                    **base,
+                    "id": doc_id,
+                    "title": base.get("title", "未知"),
+                    "content": base.get("content", ""),
+                    "score": round(hybrid_score, 4),
+                    "dense_score": dense_score,
+                    "sparse_score": sparse_score,
+                    "source": "hybrid+linear",
+                })
         fused.sort(key=lambda x: x["score"], reverse=True)
 
-        # ── 重排（Cross-Encoder / LLM / 跳过） ──
         if rerank and fused:
-            mode = RERANK_MODE
             candidates = fused[:HYBRID_TOP_K]
-            if mode == "cross-encoder":
+            if RERANK_MODE == "cross-encoder":
                 return _ce_rerank(candidates, query, top_k=top_k)
-            elif mode == "llm":
+            if RERANK_MODE == "llm":
                 return _llm_rerank(candidates, query, top_k=top_k)
-            # mode == "none": fall through to return fused
-
         return fused[:top_k]
 
-    def get_relevant_procedure(self, step_name: str, top_k: int = 2) -> list[dict]:
-        """专项检索：从《贵州省发展党员工作规程（试行）》中检索指定步骤
-
-        Args:
-            step_name: 步骤名称（如 "递交入党申请书"、"确定发展对象"、"政治审查"）
-            top_k: 返回结果数
-
-        Returns:
-            匹配的规程段落列表
-        """
-        # 构建专有查询，在标题中精确匹配
-        query = f"贵州省发展党员工作规程 {step_name}"
-        results = self.search(query, top_k=top_k, rerank=True)
-
-        # 如果结果不够，放宽匹配
+    def get_relevant_procedure(self, step_name: str, top_k: int = 2) -> list[dict[str, Any]]:
+        results = self.search(f"贵州省发展党员工作规程 {step_name}", top_k=top_k, rerank=True)
         if len(results) < top_k:
-            broader = self.search(step_name, top_k=top_k * 2, rerank=True)
-            seen_ids = {r["id"] for r in results}
-            for r in broader:
-                if r["id"] not in seen_ids and step_name in r["title"]:
-                    results.append(r)
-                    seen_ids.add(r["id"])
-
+            seen = {r["id"] for r in results}
+            for item in self.search(step_name, top_k=top_k * 2, rerank=True):
+                if item["id"] not in seen:
+                    results.append(item)
+                    seen.add(item["id"])
+                if len(results) >= top_k:
+                    break
         return results[:top_k]
 
-    def format_citations(
-        self,
-        results: list[dict],
-        min_score: float = 0.15,
-    ) -> str:
-        """将检索结果格式化为可读引用文本"""
-        valid = [r for r in results if r["score"] >= min_score]
+    def format_citations(self, results: list[dict[str, Any]], min_score: float = 0.15) -> str:
+        valid = [r for r in results if r.get("score", 0) >= min_score]
         if not valid:
             return ""
-
-        lines = ["📖 知识库引用："]
-        for i, r in enumerate(valid, 1):
-            lines.append(f"\n{i}. **{r['title']}** (相关度: {r['score']:.0%})")
-            content = r["content"][:150].strip()
-            if len(r["content"]) > 150:
-                content += "……"
-            lines.append(f"   > {content}")
+        lines = ["知识库引用："]
+        for i, result in enumerate(valid, 1):
+            citation = result.get("citation") or result.get("title", "未知")
+            lines.append(f"\n{i}. {citation} (相关度: {result.get('score', 0):.0%})")
+            evidence = result.get("content", "")[:180].strip()
+            if len(result.get("content", "")) > 180:
+                evidence += "..."
+            lines.append(f"   证据：{evidence}")
         lines.append(f"\n--- 共检索 {len(valid)} 条相关规程 ---")
         return "\n".join(lines)
 
     def enhanced_system_context(self, query: str, top_k: int = 3) -> str:
-        """根据查询，生成增强的系统上下文（用于注入 agent prompt）
-
-        输出结构化的知识参考信息 JSON，包含 id 方便前端渲染气泡。
-        """
         results = self.search(query, top_k=top_k, rerank=True)
-        if not results:
-            return json.dumps({"knowledge": []}, ensure_ascii=False)
-            
-        valid = [r for r in results if r["score"] >= 0.15]
-        if not valid:
-            return json.dumps({"knowledge": []}, ensure_ascii=False)
+        valid = [r for r in results if r.get("score", 0) >= 0.15]
+        knowledge = []
+        for i, result in enumerate(valid, 1):
+            content = result.get("content", "").strip()
+            context = result.get("parent_context", "").strip()
+            knowledge.append(
+                {
+                    "id": str(i),
+                    "title": result.get("title", ""),
+                    "content": content[:300] + ("..." if len(content) > 300 else ""),
+                    "evidence": content,
+                    "context": context,
+                    "citation": result.get("citation", result.get("title", "")),
+                    "chunk_type": result.get("chunk_type", "text"),
+                }
+            )
+        return json.dumps({"knowledge": knowledge}, ensure_ascii=False)
 
-        knowledge_list = []
-        for i, r in enumerate(valid, 1):
-            knowledge_list.append({
-                "id": str(i),
-                "title": r["title"],
-                "content": r["content"][:300].strip() + ("..." if len(r["content"]) > 300 else "")
-            })
-
-        return json.dumps({"knowledge": knowledge_list}, ensure_ascii=False)
-
-
-# ══════════════════════════════════════════════════════
-#  6. 插件：知识库管理 CLI
-# ══════════════════════════════════════════════════════
 
 def rebuild_command() -> None:
-    """CLI 入口：重建知识库"""
-    # 清理旧索引
     if CHROMA_DIR.exists():
-        import shutil
         shutil.rmtree(CHROMA_DIR)
     if CHUNK_INDEX_FILE.exists():
         CHUNK_INDEX_FILE.unlink()
-
+    if PARENT_INDEX_FILE.exists():
+        PARENT_INDEX_FILE.unlink()
     result = build_knowledge_base()
     print(f"[RAG] {result['message']}", file=sys.stderr)
 
 
-def status_command() -> dict:
-    """返回知识库状态"""
+def status_command() -> dict[str, Any]:
     rag = VectorRAG()
     if not rag._ensure_initialized():
-        return {"ready": False, "chunks": 0, "message": "知识库未构建，请先运行 uv run python -m partymate.tools.rag --rebuild"}
+        return {"ready": False, "chunks": 0, "parents": 0, "message": "知识库未构建，请先运行 uv run python -m partymate.tools.rag --rebuild"}
     try:
         chunk_count = rag._chroma_collection.count()
-        return {"ready": True, "chunks": chunk_count, "message": f"知识库就绪，{chunk_count} 个语义块"}
-    except Exception as e:
-        return {"ready": False, "chunks": 0, "message": str(e)}
+        parent_count = len(rag._parents)
+        return {
+            "ready": True,
+            "chunks": chunk_count,
+            "parents": parent_count,
+            "message": f"知识库就绪，{chunk_count} 个 child chunks，{parent_count} 个 parent chunks",
+        }
+    except Exception as exc:
+        return {"ready": False, "chunks": 0, "parents": 0, "message": str(exc)}
 
-
-# ══════════════════════════════════════════════════════
-#  7. 兼容旧接口（保持向后兼容）
-# ══════════════════════════════════════════════════════
 
 _rag_instance: VectorRAG | None = None
 
@@ -846,44 +1190,38 @@ def _get_rag() -> VectorRAG:
     return _rag_instance
 
 
-def search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
-    """兼容旧接口：搜索知识库"""
+def search(query: str, top_k: int = DEFAULT_TOP_K) -> list[dict[str, Any]]:
     return _get_rag().search(query, top_k=top_k)
 
 
-def format_citations(results: list[dict], min_score: float = 0.15) -> str:
-    """兼容旧接口：格式化引用"""
+def format_citations(results: list[dict[str, Any]], min_score: float = 0.15) -> str:
     return _get_rag().format_citations(results, min_score=min_score)
 
 
-def search_with_fallback(query: str, top_k: int = 3) -> list[dict]:
-    """兼容旧接口：搜索 + 保底"""
+def search_with_fallback(query: str, top_k: int = 3) -> list[dict[str, Any]]:
     return _get_rag().search(query, top_k=top_k)
 
 
-def get_rag_status() -> dict:
-    """获取 RAG 状态"""
+def get_rag_status() -> dict[str, Any]:
     return status_command()
 
 
-# ══════════════════════════════════════════════════════
-#  8. CLI 入口
-# ══════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    import sys
-
     if len(sys.argv) > 1 and sys.argv[1] == "--rebuild":
         rebuild_command()
     elif len(sys.argv) > 2 and sys.argv[1] == "--search":
-        query = sys.argv[2]
         rag = _get_rag()
-        results = rag.search(query)
+        results = rag.search(sys.argv[2])
         print(rag.format_citations(results), file=sys.stderr)
     elif len(sys.argv) > 2 and sys.argv[1] == "--procedure":
-        step = sys.argv[2]
         rag = _get_rag()
-        results = rag.get_relevant_procedure(step)
+        results = rag.get_relevant_procedure(sys.argv[2])
         print(rag.format_citations(results), file=sys.stderr)
     else:
-        print("用法:\n  uv run python -m partymate.tools.rag --rebuild        # 重建知识库\n  uv run python -m partymate.tools.rag --search <query>  # 搜索知识库\n  uv run python -m partymate.tools.rag --procedure <step> # 检索规程步骤")
+        print(
+            "用法:\n"
+            "  uv run python -m partymate.tools.rag --rebuild\n"
+            "  uv run python -m partymate.tools.rag --search <query>\n"
+            "  uv run python -m partymate.tools.rag --procedure <step>",
+            file=sys.stderr,
+        )
